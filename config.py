@@ -18,6 +18,10 @@ class Config:
     simkl_access_token: str
     dry_run: bool = True
     batch_size: int = 50
+    imdb_enabled: bool = False
+    imdb_cookie: str = ""
+    imdb_dry_run: bool = True
+    imdb_max_writes: int = 25
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -27,6 +31,10 @@ class Config:
             simkl_access_token=os.getenv("SIMKL_ACCESS_TOKEN", "").strip(),
             dry_run=_bool_env("DRY_RUN", True),
             batch_size=max(1, min(200, int(os.getenv("BATCH_SIZE", "50")))),
+            imdb_enabled=_bool_env("IMDB_ENABLED", False),
+            imdb_cookie=os.getenv("IMDB_COOKIE", "").strip(),
+            imdb_dry_run=_bool_env("IMDB_DRY_RUN", True),
+            imdb_max_writes=max(1, min(100, int(os.getenv("IMDB_MAX_WRITES", "25")))),
         )
         missing = [
             name
@@ -37,6 +45,8 @@ class Config:
             )
             if not value
         ]
+        if cfg.imdb_enabled and not cfg.imdb_cookie:
+            missing.append("IMDB_COOKIE")
         if missing:
             raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
         return cfg
