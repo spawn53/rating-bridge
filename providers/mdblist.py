@@ -18,6 +18,9 @@ class MDBListClient:
     def __init__(self, api_key: str, timeout: float = 60.0):
         self.api_key = api_key
         self.timeout = timeout
+        self.last_rating_counts: dict[str, int] = {
+            "movies": 0, "shows": 0, "seasons": 0, "episodes": 0
+        }
 
     def _get_all(self, path: str) -> dict[str, list[dict[str, Any]]]:
         merged: dict[str, list[dict[str, Any]]] = {
@@ -69,6 +72,7 @@ class MDBListClient:
 
     def get_ratings(self) -> dict[str, RatingItem]:
         raw = self._get_all("/sync/ratings")
+        self.last_rating_counts = {bucket: len(raw.get(bucket, [])) for bucket in self.last_rating_counts}
         out: dict[str, RatingItem] = {}
         for bucket, media_type, nested_key in (
             ("movies", "movie", "movie"),
