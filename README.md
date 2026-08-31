@@ -67,7 +67,9 @@ python bridge.py
 
 ## GitHub Actions
 
-`.github/workflows/rating-sync.yml` runs at minute 37 of every hour and can also be run manually from the Actions tab.
+During initial setup, `.github/workflows/rating-sync.yml` is **manual-only**. This avoids scheduled failures before the required secrets exist.
+
+After the first successful dry run, enable the hourly schedule (minute 37) and then change `DRY_RUN` to `false` when the proposed changes look correct.
 
 The workflow has only `contents: read` permission and does not commit user data back into this public repository.
 
