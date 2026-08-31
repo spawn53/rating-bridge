@@ -22,6 +22,10 @@ jobs:
       SIMKL_ACCESS_TOKEN: ${{ secrets.SIMKL_ACCESS_TOKEN }}
       DRY_RUN: ${{ vars.DRY_RUN }}
       BATCH_SIZE: "50"
+      IMDB_ENABLED: ${{ vars.IMDB_ENABLED }}
+      IMDB_DRY_RUN: ${{ vars.IMDB_DRY_RUN }}
+      IMDB_COOKIE: ${{ secrets.IMDB_COOKIE }}
+      IMDB_MAX_WRITES: "25"
 
     steps:
       - uses: actions/checkout@v4
