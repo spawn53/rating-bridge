@@ -1,15 +1,30 @@
 services:
   rating-hub:
+    image: nuvio-rating-hub:local
     build:
       context: .
       dockerfile: Dockerfile.v2
     container_name: rating-hub
     restart: unless-stopped
+    env_file:
+      - .env.v2
     environment:
       RATING_HUB_DB: /data/rating-hub.sqlite3
-      RATING_HUB_API_KEY: ${RATING_HUB_API_KEY:?set RATING_HUB_API_KEY}
-      RATING_HUB_TARGETS: ${RATING_HUB_TARGETS:-mdblist,trakt,simkl,tmdb}
     volumes:
       - /srv/data/rating-hub:/data
     ports:
       - "127.0.0.1:8787:8787"
+
+  rating-hub-worker:
+    image: nuvio-rating-hub:local
+    container_name: rating-hub-worker
+    restart: unless-stopped
+    command: ["python", "-m", "hub.worker"]
+    env_file:
+      - .env.v2
+    environment:
+      RATING_HUB_DB: /data/rating-hub.sqlite3
+    volumes:
+      - /srv/data/rating-hub:/data
+    depends_on:
+      - rating-hub
