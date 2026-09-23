@@ -66,6 +66,7 @@ class RatingResponse(BaseModel):
     rating: int
     revision: int
     queued_targets: list[str]
+    skipped_targets: list[str] = []
     rated_at: str
     updated_at: str
 
@@ -75,3 +76,4 @@ class DeleteResponse(BaseModel):
     removed: bool
     revision: int | None = None
     queued_targets: list[str] = []
+    skipped_targets: list[str] = []
