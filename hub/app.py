@@ -37,6 +37,7 @@ def health() -> dict[str, object]:
     return {
         "status": "ok",
         "version": VERSION,
+        "db_path": settings.db_path,
         "configured_targets": list(settings.targets),
         "capabilities": {key: sorted(value) for key, value in CAPABILITIES.items()},
         "api_key_configured": bool(settings.api_key),
