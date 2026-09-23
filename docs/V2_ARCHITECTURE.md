@@ -83,9 +83,19 @@ the episode UI or post-play flow. Nuvio sends one request only: to Rating Hub.
 
 ### Phase 4 — experimental providers
 
-- IMDb via isolated private-web adapter behind an explicit feature flag
-- Letterboxd only if a sufficiently reliable authenticated write path is
-  available; it must never be required for a successful hub write
+- IMDb V2 is implemented as an isolated private-web GraphQL adapter behind
+  `IMDB_V2_ENABLED`. It supports movie/show/episode writes when a canonical
+  IMDb `tt...` ID is present. Both upsert and remove mutations are implemented.
+  Live writes remain disabled by default.
+- Letterboxd is implemented using OAuth2 refresh tokens and the documented
+  `PATCH /me/rate/{id}` endpoint. The hub converts 1–10 to 0.5–5.0 exactly,
+  with no rounding loss. Live writes remain disabled by default.
+- Letterboxd's current API models Film, Show, Season and Episode as Production
+  types and the rating endpoint accepts a generic rateable object. V2 still
+  enables movie delivery only until production-ID resolution for TV/episodes
+  is verified against a live account.
+- Letterboxd documents that setting a rating also marks that production watched.
+  This is expected provider behavior and must be considered during preflight.
 
 ## Security
 
