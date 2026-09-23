@@ -60,3 +60,26 @@ def test_store_upsert_and_delete_are_outboxed(tmp_path: Path) -> None:
     pending = store.list_outbox()
     assert len(pending) == 4
     assert [row["action"] for row in pending[-2:]] == ["remove", "remove"]
+
+def test_episode_capabilities_skip_unverified_targets() -> None:
+    from hub.capabilities import split_supported
+
+    supported, skipped = split_supported(
+        "episode", ["mdblist", "trakt", "simkl", "tmdb"]
+    )
+    assert supported == ("trakt", "tmdb")
+    assert skipped == ("mdblist", "simkl")
+
+
+def test_worker_retry_state(tmp_path: Path) -> None:
+    store = RatingStore(str(tmp_path / "retry.sqlite3"))
+    item = RatingWrite(media_type="movie", tmdb_id=550, rating=9)
+    store.upsert_rating(item, ["tmdb"])
+
+    job = store.claim_next_job()
+    assert job is not None
+    assert job["target"] == "tmdb"
+    assert job["attempts"] == 1
+
+    state = store.fail_job(job["id"], "temporary", permanent=False)
+    assert state == "pending"
