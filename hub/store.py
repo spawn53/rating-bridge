@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -253,6 +253,101 @@ class RatingStore:
                 (limit, offset),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def claim_next_job(self) -> dict[str, Any] | None:
+        now = _now()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM outbox
+                WHERE status = 'pending'
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                ORDER BY id
+                LIMIT 1
+                """,
+                (now,),
+            ).fetchone()
+            if row is None:
+                return None
+
+            cursor = conn.execute(
+                """
+                UPDATE outbox
+                SET status = 'processing', attempts = attempts + 1, updated_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (now, row["id"]),
+            )
+            if cursor.rowcount != 1:
+                return None
+            claimed = conn.execute(
+                "SELECT * FROM outbox WHERE id = ?", (row["id"],)
+            ).fetchone()
+
+        if claimed is None:
+            return None
+        job = dict(claimed)
+        job["payload"] = json.loads(job.pop("payload_json"))
+        return job
+
+    def complete_job(self, job_id: int) -> None:
+        now = _now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE outbox
+                SET status = 'done', next_attempt_at = NULL,
+                    last_error = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, job_id),
+            )
+
+    def fail_job(self, job_id: int, error: str, *, permanent: bool) -> str:
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT attempts FROM outbox WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return "missing"
+
+            attempts = int(row["attempts"])
+            exhausted = attempts >= 8
+            if permanent or exhausted:
+                status = "failed"
+                next_attempt = None
+            else:
+                status = "pending"
+                delay = min(3600, 15 * (2 ** max(0, attempts - 1)))
+                next_attempt = (now_dt + timedelta(seconds=delay)).isoformat()
+
+            conn.execute(
+                """
+                UPDATE outbox
+                SET status = ?, next_attempt_at = ?, last_error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (status, next_attempt, error[:1000], now, job_id),
+            )
+        return status
+
+    def requeue_stale_processing(self, stale_minutes: int = 10) -> int:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)
+        ).isoformat()
+        now = _now()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE outbox
+                SET status = 'pending', updated_at = ?
+                WHERE status = 'processing' AND updated_at <= ?
+                """,
+                (now, cutoff),
+            )
+            return int(cursor.rowcount)
 
     def list_outbox(self, status: str = "pending", limit: int = 100) -> list[dict[str, Any]]:
         with self._connect() as conn:
