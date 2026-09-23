@@ -58,8 +58,9 @@ def test_store_upsert_and_delete_are_outboxed(tmp_path: Path) -> None:
     assert store.get_rating(item.content_key) is None
 
     pending = store.list_outbox()
-    assert len(pending) == 4
-    assert [row["action"] for row in pending[-2:]] == ["remove", "remove"]
+    assert len(pending) == 2
+    assert [row["action"] for row in pending] == ["remove", "remove"]
+    assert len(store.list_outbox("superseded")) == 2
 
 def test_episode_capabilities_skip_unverified_targets() -> None:
     from hub.capabilities import split_supported

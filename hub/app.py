@@ -99,7 +99,7 @@ def remove_rating(content_key: str) -> DeleteResponse:
     dependencies=[Depends(require_api_key)],
 )
 def outbox(
-    status: str = Query(default="pending", pattern="^(pending|processing|done|failed)$"),
+    status: str = Query(default="pending", pattern="^(pending|processing|done|failed|superseded)$"),
     limit: int = Query(default=100, ge=1, le=1000),
 ) -> list[dict[str, object]]:
     return store.list_outbox(status=status, limit=limit)
