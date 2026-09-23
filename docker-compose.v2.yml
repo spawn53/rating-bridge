@@ -1,0 +1,15 @@
+services:
+  rating-hub:
+    build:
+      context: .
+      dockerfile: Dockerfile.v2
+    container_name: rating-hub
+    restart: unless-stopped
+    environment:
+      RATING_HUB_DB: /data/rating-hub.sqlite3
+      RATING_HUB_API_KEY: ${RATING_HUB_API_KEY:?set RATING_HUB_API_KEY}
+      RATING_HUB_TARGETS: ${RATING_HUB_TARGETS:-mdblist,trakt,simkl,tmdb}
+    volumes:
+      - /srv/data/rating-hub:/data
+    ports:
+      - "127.0.0.1:8787:8787"
