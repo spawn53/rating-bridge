@@ -4,6 +4,7 @@ import hmac
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
+from hub.capabilities import CAPABILITIES, split_supported
 from hub.models import DeleteResponse, RatingResponse, RatingWrite
 from hub.settings import HubSettings
 from hub.store import RatingStore
@@ -37,6 +38,7 @@ def health() -> dict[str, object]:
         "status": "ok",
         "version": VERSION,
         "configured_targets": list(settings.targets),
+        "capabilities": {key: sorted(value) for key, value in CAPABILITIES.items()},
         "api_key_configured": bool(settings.api_key),
     }
 
@@ -47,8 +49,11 @@ def health() -> dict[str, object]:
     dependencies=[Depends(require_api_key)],
 )
 def put_rating(command: RatingWrite) -> RatingResponse:
-    targets = tuple(command.targets) if command.targets is not None else settings.targets
-    return RatingResponse(**store.upsert_rating(command, targets))
+    requested = tuple(command.targets) if command.targets is not None else settings.targets
+    supported, skipped = split_supported(command.media_type, requested)
+    result = store.upsert_rating(command, supported)
+    result["skipped_targets"] = list(skipped)
+    return RatingResponse(**result)
 
 
 @app.get(
@@ -79,7 +84,13 @@ def get_rating(content_key: str) -> dict[str, object]:
     dependencies=[Depends(require_api_key)],
 )
 def remove_rating(content_key: str) -> DeleteResponse:
-    return DeleteResponse(**store.delete_rating(content_key, settings.targets))
+    current = store.get_rating(content_key)
+    if current is None:
+        return DeleteResponse(content_key=content_key, removed=False)
+    supported, skipped = split_supported(str(current["media_type"]), settings.targets)
+    result = store.delete_rating(content_key, supported)
+    result["skipped_targets"] = list(skipped)
+    return DeleteResponse(**result)
 
 
 @app.get(
