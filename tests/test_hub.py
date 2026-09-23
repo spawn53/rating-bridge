@@ -83,3 +83,58 @@ def test_worker_retry_state(tmp_path: Path) -> None:
 
     state = store.fail_job(job["id"], "temporary", permanent=False)
     assert state == "pending"
+
+
+
+def test_letterboxd_rating_conversion_is_lossless() -> None:
+    from hub.providers.letterboxd import rating_to_stars
+
+    assert [rating_to_stars(value) for value in range(1, 11)] == [
+        0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0
+    ]
+
+
+def test_imdb_builds_episode_rating_mutations() -> None:
+    from hub.providers.imdb_v2 import IMDbProvider
+
+    upsert = IMDbProvider.build_request("upsert", "tt1480055", 9)
+    assert upsert["operationName"] == "UpdateTitleRating"
+    assert upsert["variables"] == {"rating": 9, "titleId": "tt1480055"}
+    assert "rateTitle" in str(upsert["query"])
+
+    remove = IMDbProvider.build_request("remove", "tt1480055", None)
+    assert remove["operationName"] == "DeleteTitleRating"
+    assert remove["variables"] == {"titleId": "tt1480055"}
+    assert "deleteTitleRating" in str(remove["query"])
+
+
+def test_experimental_registry_is_guarded(monkeypatch: pytest.MonkeyPatch) -> None:
+    from hub.providers.base import ProviderNotConfigured
+    from hub.providers.registry import get_provider
+
+    monkeypatch.delenv("IMDB_V2_ENABLED", raising=False)
+    monkeypatch.delenv("LETTERBOXD_ENABLED", raising=False)
+
+    with pytest.raises(ProviderNotConfigured):
+        get_provider("imdb")
+    with pytest.raises(ProviderNotConfigured):
+        get_provider("letterboxd")
+
+
+def test_experimental_registry_allows_safe_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    from hub.providers.imdb_v2 import IMDbProvider
+    from hub.providers.letterboxd import LetterboxdProvider
+    from hub.providers.registry import get_provider
+
+    monkeypatch.setenv("IMDB_V2_ENABLED", "true")
+    monkeypatch.setenv("IMDB_V2_DRY_RUN", "true")
+    monkeypatch.delenv("IMDB_COOKIE", raising=False)
+
+    monkeypatch.setenv("LETTERBOXD_ENABLED", "true")
+    monkeypatch.setenv("LETTERBOXD_DRY_RUN", "true")
+    monkeypatch.delenv("LETTERBOXD_CLIENT_ID", raising=False)
+    monkeypatch.delenv("LETTERBOXD_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("LETTERBOXD_REFRESH_TOKEN", raising=False)
+
+    assert isinstance(get_provider("imdb"), IMDbProvider)
+    assert isinstance(get_provider("letterboxd"), LetterboxdProvider)
