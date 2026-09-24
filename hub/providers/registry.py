@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 
+from hub.auth import auth_status, oauth_access_token, stored_value
+
 from hub.providers.base import ProviderNotConfigured, RatingProvider
 from hub.providers.imdb_v2 import IMDbProvider
 from hub.providers.letterboxd import LetterboxdProvider
@@ -25,16 +27,15 @@ def _bool_env(name: str, default: bool = False) -> bool:
 def get_provider(name: str) -> RatingProvider:
     if name == "trakt":
         client_id = _env("TRAKT_CLIENT_ID")
-        access_token = _env("TRAKT_ACCESS_TOKEN")
-        if not client_id or not access_token:
+        if auth_status("trakt", offline=True) in {"UNCONFIGURED", "NEEDS_AUTHORIZATION", "AUTH_FAILED"}:
             raise ProviderNotConfigured(
-                "Trakt requires TRAKT_CLIENT_ID and TRAKT_ACCESS_TOKEN"
+                "Trakt OAuth authorization and refresh configuration are required"
             )
-        return TraktProvider(client_id, access_token)
+        return TraktProvider(client_id, "", token_supplier=lambda: oauth_access_token("trakt"))
 
     if name == "tmdb":
         api_read_token = _env("TMDB_API_READ_TOKEN")
-        session_id = _env("TMDB_SESSION_ID")
+        session_id = stored_value("tmdb", "session_id", "TMDB_SESSION_ID")
         if not api_read_token or not session_id:
             raise ProviderNotConfigured(
                 "TMDb requires TMDB_API_READ_TOKEN and TMDB_SESSION_ID"
@@ -42,16 +43,15 @@ def get_provider(name: str) -> RatingProvider:
         return TMDbProvider(api_read_token, session_id)
 
     if name == "mdblist":
-        access_token = _env("MDBLIST_ACCESS_TOKEN")
-        if not access_token:
+        if auth_status("mdblist", offline=True) in {"UNCONFIGURED", "NEEDS_AUTHORIZATION", "AUTH_FAILED"}:
             raise ProviderNotConfigured(
-                "MDBList V2 writes require MDBLIST_ACCESS_TOKEN"
+                "MDBList rating sync requires its own OAuth device authorization"
             )
-        return MDBListProvider(access_token)
+        return MDBListProvider("", token_supplier=lambda: oauth_access_token("mdblist"))
 
     if name == "simkl":
         client_id = _env("SIMKL_CLIENT_ID")
-        access_token = _env("SIMKL_ACCESS_TOKEN")
+        access_token = stored_value("simkl", "access_token", "SIMKL_ACCESS_TOKEN")
         if not client_id or not access_token:
             raise ProviderNotConfigured(
                 "Simkl requires SIMKL_CLIENT_ID and SIMKL_ACCESS_TOKEN"

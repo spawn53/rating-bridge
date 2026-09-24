@@ -12,6 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from hub.auth import auth_status
+
 
 def _value(name: str) -> str:
     return os.getenv(name, "").strip()
@@ -26,60 +28,20 @@ def _configured(*names: str) -> bool:
     return all(_value(name) for name in names)
 
 
-def _get(url: str, *, headers: dict[str, str] | None = None, params: dict[str, str] | None = None) -> bool:
-    """Perform only a read-only request; discard bodies and error details."""
-    try:
-        import httpx
-    except ImportError:
-        return False
-    try:
-        with httpx.Client(timeout=10.0, follow_redirects=False) as client:
-            response = client.get(url, headers=headers, params=params)
-        return response.is_success
-    except httpx.HTTPError:
-        return False
-
-
-def _auth_header(token: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-
-
 def _check_mdblist(offline: bool) -> str:
-    token = _value("MDBLIST_ACCESS_TOKEN")
-    if not token:
-        return "MISSING"
-    if offline:
-        return "CONFIGURED — offline auth not tested"
-    return "READY" if _get("https://api.mdblist.com/user", headers=_auth_header(token)) else "CONFIGURED — live auth check failed"
+    return auth_status("mdblist", offline=offline)
 
 
 def _check_trakt(offline: bool) -> str:
-    client_id, token = _value("TRAKT_CLIENT_ID"), _value("TRAKT_ACCESS_TOKEN")
-    if not client_id or not token:
-        return "MISSING"
-    if offline:
-        return "CONFIGURED — offline auth not tested"
-    headers = {**_auth_header(token), "trakt-api-version": "2", "trakt-api-key": client_id}
-    return "READY" if _get("https://api.trakt.tv/users/settings", headers=headers) else "CONFIGURED — live auth check failed"
+    return auth_status("trakt", offline=offline)
 
 
 def _check_simkl(offline: bool) -> str:
-    client_id, token = _value("SIMKL_CLIENT_ID"), _value("SIMKL_ACCESS_TOKEN")
-    if not client_id or not token:
-        return "MISSING"
-    if offline:
-        return "CONFIGURED — offline auth not tested"
-    headers = {**_auth_header(token), "simkl-api-key": client_id}
-    return "READY" if _get("https://api.simkl.com/users/settings", headers=headers) else "CONFIGURED — live auth check failed"
+    return auth_status("simkl", offline=offline)
 
 
 def _check_tmdb(offline: bool) -> str:
-    token, session = _value("TMDB_API_READ_TOKEN"), _value("TMDB_SESSION_ID")
-    if not token or not session:
-        return "MISSING"
-    if offline:
-        return "CONFIGURED — offline auth not tested"
-    return "READY" if _get("https://api.themoviedb.org/3/account", headers=_auth_header(token), params={"session_id": session}) else "CONFIGURED — live auth check failed"
+    return auth_status("tmdb", offline=offline)
 
 
 def _experimental(enabled_name: str, dry_run_name: str, credentials: tuple[str, ...]) -> str:

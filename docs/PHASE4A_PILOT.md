@@ -2,14 +2,14 @@
 
 Run `scripts/live_pilot.py` manually for one approved movie and one provider at a time. It requires `--confirm-live-write`, a `movie:tmdb:<id>` content key, and valid local credentials. It reads the original personal rating, verifies two temporary ratings, and attempts to restore the original rating. The script never runs from the API or worker.
 
-The pilot currently fails closed for MDBList because its public API documentation does not establish a personal-rating read contract. Do not infer that a title is unrated from a metadata rating or an undocumented response.
+The MDBList pilot remains gated during the authentication phase. Its published API now documents GET /sync/ratings with cursor pagination; the new read helper fails closed on unrecognized item shapes. Do not infer that a title is unrated from a metadata rating or an unverified response.
 
 | Provider | Existing personal rating read | Write/remove | Rating scale | Guard |
 | --- | --- | --- | --- | --- |
 | TMDb | [Movie account states](https://developer.themoviedb.org/reference/movie-account-states) | [Add](https://developer.themoviedb.org/reference/movie-add-rating) / [delete](https://developer.themoviedb.org/reference/movie-delete-rating) | 0.5–10, half steps | Refuse movies on watchlist because an add rating can remove a watchlist entry. |
 | Trakt | [User movie ratings](https://docs.trakt.tv/reference/getusersratingsmovies) | Existing adapter `/sync/ratings` and `/sync/ratings/remove` | 1–10 integer | Read every page; retain `rated_at` for restoration. |
 | Simkl | [User ratings and library state](https://api.simkl.org/api-reference/simkl/get-user-ratings) | [Add](https://api.simkl.org/api-reference/simkl/add-ratings) / [remove](https://api.simkl.org/api-reference/simkl/remove-ratings) | 1–10 integer | Require the movie already in the library and verify its list status stays unchanged. |
-| MDBList | [Public API entry point](https://docs.mdblist.com/docs/api) does not specify a personal-rating read | Existing adapter `/sync/ratings` and `/sync/ratings/remove` | Unverified | Pilot blocked until original state and rollback contracts are verified. |
+| MDBList | [GET /sync/ratings](https://api.mdblist.com/schema/) with cursor pagination | Existing adapter `/sync/ratings` and `/sync/ratings/remove` | 1–10 integer for the read helper | Pilot remains blocked until an authenticated response shape and rollback are verified. |
 
 The production capability matrix remains unchanged: MDBList and Simkl support movie/show; Trakt and TMDb support movie/show/episode. This tool is movie-only. No episode or four-provider fan-out run should start until each provider's individual movie pilot succeeds and its original state can be restored. Before an API pilot, make a SQLite backup and choose a movie known to be unrated on all four providers if their original ratings differ.
 

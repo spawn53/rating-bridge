@@ -142,8 +142,14 @@ def read_state(name: str, tmdb_id: int, provider: object, client: object) -> Sta
             raise PilotBlocked('Simkl rating was not an integer')
         return State(score, library_status=status)
 
-    # The public MDBList docs do not establish a reliable personal-rating read.
-    raise PilotBlocked('MDBList personal-rating read contract is unverified')
+    if name == 'mdblist':
+        from hub.auth_flows import mdblist_movie_rating
+        authorization = provider.headers.get('Authorization', '')
+        if not authorization.startswith('Bearer ') or len(authorization) <= 7:
+            raise PilotBlocked('MDBList OAuth access token is unavailable')
+        return State(mdblist_movie_rating(tmdb_id, authorization[7:], client))
+
+    raise PilotBlocked('unknown provider')
 
 
 def _ensure_safe(name: str, original: State, current: State) -> None:
@@ -226,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
         print('Pilot requires one movie:tmdb:<numeric ID> content key')
         return 2
     if args.provider == 'mdblist':
-        print('Pilot blocked: MDBList personal-rating read contract is unverified')
+        print('Pilot blocked: MDBList writes remain disabled until authorized Phase 4A')
         return 2
     try:
         if args.env_file:

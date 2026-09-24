@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -17,10 +17,12 @@ class TraktProvider:
         client_id: str,
         access_token: str,
         timeout: float = 30.0,
+        token_supplier: Callable[[], str] | None = None,
     ):
         self.client_id = client_id
         self.access_token = access_token
         self.timeout = timeout
+        self.token_supplier = token_supplier
 
     @property
     def headers(self) -> dict[str, str]:
@@ -28,7 +30,7 @@ class TraktProvider:
             "Content-Type": "application/json",
             "trakt-api-version": "2",
             "trakt-api-key": self.client_id,
-            "Authorization": f"Bearer {self.access_token}",
+            "Authorization": f"Bearer {self.token_supplier() if self.token_supplier else self.access_token}",
             "User-Agent": "nuvio-rating-hub/2",
         }
 

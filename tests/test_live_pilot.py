@@ -131,7 +131,7 @@ def test_simkl_read_requires_library_status() -> None:
 def test_mdblist_pilot_fails_closed(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(['--provider', 'mdblist', '--content', 'movie:tmdb:550',
                  '--confirm-live-write']) == 2
-    assert 'read contract is unverified' in capsys.readouterr().out
+    assert 'writes remain disabled' in capsys.readouterr().out
 
 
 def test_cli_does_not_echo_provider_exception_or_env_values(
@@ -148,3 +148,17 @@ def test_cli_does_not_echo_provider_exception_or_env_values(
     assert main(['--provider', 'tmdb', '--content', 'movie:tmdb:550',
                  '--confirm-live-write', '--env-file', str(env_file)]) == 1
     assert marker not in capsys.readouterr().out
+
+
+def test_mdblist_read_uses_personal_ratings_without_writing() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == 'GET'
+        assert request.url.path == '/sync/ratings'
+        assert request.headers['Authorization'] == 'Bearer test-token'
+        return httpx.Response(200, json={
+            'movies': [{'ids': {'tmdb': 550}, 'rating': 7}],
+            'pagination': {'next_cursor': None},
+        })
+    provider = SimpleNamespace(headers={'Authorization': 'Bearer test-token'})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        assert read_state('mdblist', 550, provider, client) == State(7)

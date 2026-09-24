@@ -28,7 +28,7 @@ def test_offline_preflight_does_not_make_network_calls(monkeypatch: pytest.Monke
     def fail(*args: object, **kwargs: object) -> None:
         raise AssertionError("network call in offline mode")
 
-    monkeypatch.setattr(preflight, "_get", fail)
+    monkeypatch.setattr("hub.auth.httpx.Client", fail)
     assert preflight.main(["--offline"]) == 0
     output = capsys.readouterr().out
     assert "MDBList" in output and "IMDb" in output and "Letterboxd" in output
@@ -56,7 +56,7 @@ def test_optional_missing_providers_do_not_fail_preflight() -> None:
         cwd=ROOT, env=env, text=True, capture_output=True, check=False,
     )
     assert result.returncode == 0
-    assert "MISSING" in result.stdout
+    assert "UNCONFIGURED" in result.stdout
 
 
 def test_default_targets_exclude_experimental_providers(monkeypatch: pytest.MonkeyPatch) -> None:
