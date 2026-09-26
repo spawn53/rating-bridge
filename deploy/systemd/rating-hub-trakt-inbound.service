@@ -1,5 +1,5 @@
 [Unit]
-Description=Rating Hub Trakt movie observation (no automatic apply)
+Description=Rating Hub Trakt movie polling (guarded optional application)
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target

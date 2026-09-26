@@ -39,8 +39,8 @@ def store(tmp_path):
     with inbound.connect() as c:
         c.execute("UPDATE outbox SET status='done'")
     observe(inbound, lambda: Snapshot(()), baseline=True)
-    observe(inbound, lambda: Snapshot(()))
-    observe(inbound, lambda: Snapshot(()))
+    observe(inbound, lambda: Snapshot(()), baseline=True, reset=True)
+    observe(inbound, lambda: Snapshot(()), baseline=True, reset=True)
     observe(inbound, lambda: Snapshot((MovieRating(8, DATE, 265189, 163864, "tt2121382"),)))
     assert rows(inbound, "ratings")[0]["revision"] == 5
     assert rows(inbound, "inbound_events")[0]["generation"] == 4

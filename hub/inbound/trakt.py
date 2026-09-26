@@ -20,6 +20,9 @@ class InboundSettings:
     enabled: bool = False
     media_types: tuple[str, ...] = ("movie",)
     poll_seconds: int = 300
+    auto_apply: bool = False
+    auto_apply_max_events: int = 10
+    echo_grace_seconds: int = 600
 
     @classmethod
     def from_env(cls) -> "InboundSettings":
@@ -31,7 +34,14 @@ class InboundSettings:
             raise InboundError("Trakt inbound polling interval was invalid") from None
         if enabled not in {"false", "true"} or media != ("movie",) or interval < 1:
             raise InboundError("Trakt inbound settings must remain movie-only with a valid interval")
-        return cls(enabled == "true", media, interval)
+        auto = os.getenv("TRAKT_INBOUND_AUTO_APPLY", "false").strip().lower()
+        limit = os.getenv("TRAKT_INBOUND_AUTO_APPLY_MAX_EVENTS", "10").strip()
+        grace = os.getenv("TRAKT_INBOUND_ECHO_GRACE_SECONDS", "600").strip()
+        if (auto not in {"false", "true"} or not re.fullmatch(r"[0-9]{1,3}", limit)
+                or not 1 <= int(limit) <= 100 or not re.fullmatch(r"[0-9]{1,5}", grace)
+                or not 0 <= int(grace) <= 86400):
+            raise InboundError("Trakt automatic application settings were invalid")
+        return cls(enabled == "true", media, interval, auto == "true", int(limit), int(grace))
 
 
 def fetch_snapshot(provider: object, client: httpx.Client, timeout: float = 60,
@@ -185,15 +195,24 @@ def main(argv: list[str] | None = None) -> int:
             def read_scheduled() -> Snapshot:
                 with httpx.Client(timeout=10.0, follow_redirects=False) as client:
                     return fetch_snapshot(get_provider("trakt"), client)
-            result = scheduled_observe(settings.db_path, read_scheduled, enabled=inbound_settings.enabled)
+            result = scheduled_observe(
+                settings.db_path, read_scheduled, enabled=inbound_settings.enabled,
+                auto_apply_enabled=inbound_settings.auto_apply,
+                max_events=inbound_settings.auto_apply_max_events,
+                echo_grace_seconds=inbound_settings.echo_grace_seconds, targets=settings.targets,
+            )
             if result["skipped_overlap"]:
                 print("Trakt scheduled observation skipped: another instance is active")
             else:
                 print("Trakt scheduled observation complete")
-                for key in ("generation", "added", "changed", "removed", "deferred"):
-                    print(f"{key}={result[key]}")
-            print("canonical_mutations=0")
-            print("provider_writes=0")
+                for key in ("generation", "snapshot_changed", "added", "changed", "removed", "deferred",
+                            "auto_apply_enabled", "auto_candidates", "auto_applied", "auto_grace_deferred",
+                            "auto_failed", "canonical_mutations", "provider_writes"):
+                    value = result[key]
+                    print(f"{key}={str(value).lower() if type(value) is bool else value}")
+            if result["skipped_overlap"]:
+                print("canonical_mutations=0")
+                print("provider_writes=0")
             return 0
         store = InboundStore(settings.db_path)
         if removing:
@@ -254,7 +273,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{key}={result[key]}")
         return 0
     except InboundError as exc:
-        # Only this module's fixed local messages may reach operator output.
+        # Only fixed local messages and sanitized counters reach operator output.
+        if args.scheduled_observe and hasattr(exc, "result"):
+            print("Trakt automatic application failed; remaining candidates retained")
+            for key in ("generation", "snapshot_changed", "added", "changed", "removed", "deferred",
+                        "auto_apply_enabled", "auto_candidates", "auto_applied", "auto_grace_deferred",
+                        "auto_failed", "canonical_mutations", "provider_writes"):
+                if key in exc.result:
+                    value = exc.result[key]
+                    print(f"{key}={str(value).lower() if type(value) is bool else value}")
+            return 1
         print("Trakt scheduled observation failed; trusted state retained" if args.scheduled_observe
               else str(exc))
         return 1

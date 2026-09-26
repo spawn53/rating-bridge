@@ -108,9 +108,9 @@ def test_echo_remains_ignored_and_canonical_outbox_stay_unchanged(store):
         assert e['status']=='ignored' and e['reason']=='same_as_canonical'
 
 
-def test_unchanged_snapshot_advances_once_without_new_events(store):
+def test_unchanged_snapshot_keeps_content_generation_without_new_events(store):
     result=scheduled(store,lambda:Snapshot(()))
-    assert result['generation']==2 and result['events']==0
+    assert result['generation']==1 and result['events']==0 and not result['snapshot_changed']
     assert dump(store)['inbound_events']==[]
 
 
@@ -202,7 +202,7 @@ def test_enabled_cli_fetches_once_and_logs_only_sanitized_counts(cli,monkeypatch
     before=dump(cli)
     assert main(['--scheduled-observe'])==0 and len(seen)==1
     output=capsys.readouterr().out
-    assert output=='Trakt scheduled observation complete\ngeneration=2\nadded=0\nchanged=0\nremoved=0\ndeferred=0\ncanonical_mutations=0\nprovider_writes=0\n'
+    assert output=='Trakt scheduled observation complete\ngeneration=1\nsnapshot_changed=false\nadded=0\nchanged=0\nremoved=0\ndeferred=0\nauto_apply_enabled=false\nauto_candidates=0\nauto_applied=0\nauto_grace_deferred=0\nauto_failed=0\ncanonical_mutations=0\nprovider_writes=0\n'
     after=dump(cli)
     assert after['ratings']==before['ratings'] and after['outbox']==before['outbox']
     assert after['inbound_events']==before['inbound_events']
@@ -259,7 +259,7 @@ def test_manual_commands_still_work_when_disabled(cli,monkeypatch):
     mock_reads(monkeypatch,lambda request:httpx.Response(200,json=[],headers=hdr()))
     assert main(['--baseline'])==0
     assert main(['--once','--observe-only'])==0
-    assert cli.state()['generation']==2
+    assert cli.state()['generation']==1
 
 
 def test_systemd_units_are_observe_only_and_use_absolute_paths():

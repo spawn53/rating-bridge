@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import json
 import re
 import sqlite3
-from typing import Iterable
+from typing import Callable, Iterable
 
 from hub.inbound.classification import classify, targets_excluding_source
 from hub.inbound.importer import GLOBAL_TARGETS, TARGETS
@@ -107,7 +107,8 @@ def _mark_applied(store: InboundStore, *, event_id: int, key: str, generation: i
 def apply_removal_event(store: InboundStore, targets: Iterable[str], *, event_id: int,
                         expected_key: str, expected_generation: int, expected_old_rating: int,
                         expected_revision: int, expected_source: str,
-                        confirmed: bool = False) -> dict:
+                        confirmed: bool = False,
+                        automation_guard: Callable[[sqlite3.Connection], None] | None = None) -> dict:
     """Validate and delete under one write lock; recover only exact committed audit.
 
     Event marking follows canonical/outbox commit. A process exit at that boundary
@@ -133,6 +134,8 @@ def apply_removal_event(store: InboundStore, targets: Iterable[str], *, event_id
     with store.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         event = _event(conn, event_id, expected_key, expected_generation, expected_old_rating, expected_revision)
+        if automation_guard is not None:
+            automation_guard(conn)
         if event["status"] == "applied":
             return {"event_id": event_id, "content_key": expected_key, "revision": event["canonical_revision"],
                     "removed": True, "queued_targets": [], "skipped_targets": ["trakt"],

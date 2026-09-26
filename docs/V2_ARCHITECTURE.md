@@ -291,8 +291,9 @@ downstream delivery leaves the tombstone intact for outbox convergence.
 `python -m hub.inbound.trakt --scheduled-observe` performs exactly one poll and
 exits. It requires `TRAKT_INBOUND_ENABLED=true` and the existing trusted baseline
 and current schema. It does not initialize/migrate tables, create/reset a
-baseline, or invoke any import or reclassification command. Safe source defaults
-remain disabled, movie-only and 300 seconds. No auto-apply flag or path is added.
+baseline, or automatically reclassify events. With auto-apply off it invokes no
+importer. Safe source defaults remain disabled, movie-only and 300 seconds;
+Phase 5J adds a separate opt-in application flag described below.
 
 A nonblocking OS `flock` on the database directory's `trakt-inbound.lock`
 (`/data/trakt-inbound.lock` in Compose, `/srv/data/rating-hub/trakt-inbound.lock`
@@ -301,11 +302,12 @@ An overlap exits successfully with a sanitized skip and no database mutations.
 The lock inode is retained; completion, exception or process exit releases the
 kernel lock without stale PID cleanup. SQLite still protects manual imports.
 
-Scheduled success logs only generation, delta counts, and zero mutation counts.
+Scheduled output contains only generation, change/application counts and mutation counts.
 Failures use a fixed sanitized message and nonzero exit. Existing atomic
 publication retains trusted state on malformed/incomplete/failed reads and
-SQLite failure; generation advances once for each successful poll, including
-unchanged snapshots. New candidates remain observed; echoes/noops remain ignored.
+SQLite failure. Generation represents snapshot content; identical snapshots
+update only poll metadata and retain snapshot rows and their observed times.
+With auto-apply off, candidates remain observed; echoes/noops remain ignored.
 Existing applied audit is untouched. OAuth refresh continues through the normal
 provider lifecycle; secrets and response histories are never logged.
 
@@ -331,4 +333,67 @@ The timer uses `OnBootSec=2min`, `OnUnitActiveSec=5min`, `AccuracySec=1s` and
 or the configuration's poll-seconds value. Each activation performs one poll;
 there is no missed-interval replay loop. `Persistent=true` affects calendar
 timers; this monotonic timer instead gets one overdue boot activation after
-startup, then resumes five-minute recurrence. No automatic application runs.
+startup, then resumes five-minute recurrence. Application remains off by default.
+
+
+### Phase 5J: content versions and default-off guarded auto-apply
+
+Identical non-baseline snapshots preserve generation, snapshot rows, event
+fingerprints and waiting candidates. Only last-successful-poll time and counts
+update. A different hash increments generation and atomically publishes content
+and score deltas. Timestamp, identity and unmapped changes also version content,
+without inventing score events. Explicit baseline/reset retains its versioning.
+No existing generation or event is rewritten during deployment.
+
+Defaults are `TRAKT_INBOUND_AUTO_APPLY=false`,
+`TRAKT_INBOUND_AUTO_APPLY_MAX_EVENTS=10` (1..100), and
+`TRAKT_INBOUND_ECHO_GRACE_SECONDS=600` (0..86400). Invalid booleans, noninteger
+values or out-of-range numbers fail closed. The same scheduled command, oneshot,
+timer and flock cover one fetch, publication and optional application. No second
+observer read, service, lock, direct provider writer or settle loop is added.
+
+Opt-in application selects only current-generation Trakt movie events with
+observed/candidate/different-provider-state audit and upsert/delete intent.
+The complete eligible count is checked before imports; exceeding the configured
+limit applies none. Events process by ascending ID. A failure stops subsequent
+events, retains previous commits, logs fixed sanitized counters and exits
+nonzero. Ignored, echo, noop, defer, applied and stale-generation events are never
+automatically reclassified or selected.
+
+The engine derives exact expectations and calls the existing upsert/removal
+importers with confirmation from the explicitly enabled scheduler. Added events
+require absent/tombstoned canonical; changed and removed events require active
+canonical matching the old score. Removals use current source/revision. All
+identity, snapshot, transition, source exclusion and delivery-audit guards stay
+authoritative; manual commands still require their explicit confirmations.
+Imported events fan out only to `tmdb,simkl,mdblist` from unchanged four-provider
+global targets. Workers deliver asynchronously; scheduler direct writes are zero.
+
+A differing current-revision completed Trakt delivery must be at least the grace
+interval old. Creation/completion timestamps must be full UTC ISO timestamps,
+ordered consistently and not ahead of the UTC clock. Missing/malformed timing
+fails closed; older-revision audit never invokes grace. A grace-held event keeps
+its original status/classification and is counted as deferred. Automation-only
+guards recheck the plan and grace inside the importer's canonical write
+transaction, closing races after initial planning without weakening manual paths.
+
+A crash before apply leaves a candidate current after an identical next poll.
+A crash after canonical commit derives the original revision from deterministic
+event provenance and delegates exact payload-audit recovery to the existing
+importer. Removal recovery uses a nonauthorizing old-source sentinel: it can
+complete the proven audit gap but cannot authorize a new delete if state changes.
+No duplicate canonical revision/jobs are created. Counters include canonical
+commits even when subsequent event-audit marking fails.
+
+A source change before retry increments generation and excludes older candidates.
+The newest event is considered only if its own canonical old-score guards pass.
+If an intermediate score never reached canonical, the newest changed event may
+require operator review; automation does not manufacture the missing state.
+
+For Phase 5J live validation, stop (do not disable) the timer, take a mode-0600
+SQLite API backup, deploy the tested commit, and keep auto-apply false. Validate
+one unchanged manual scheduled cycle. With no candidates and timer still stopped,
+validate exactly one temporary true-flag cycle, then immediately restore false.
+Restart the same timer and verify one real observe-only activation, unchanged
+generation/snapshot rows/canonical/outbox/events, and no provider rating writes.
+Production must finish with observation enabled and automatic application off.

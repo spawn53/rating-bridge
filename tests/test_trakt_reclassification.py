@@ -125,7 +125,7 @@ def store(tmp_path, monkeypatch):
     hub.delete_rating(KEY,GLOBAL_TARGETS)
     mutate(store,"UPDATE outbox SET status='done'")
     observe(store,lambda:Snapshot(()),baseline=True)
-    for _ in range(2): observe(store,lambda:Snapshot(()))
+    for _ in range(2): observe(store,lambda:Snapshot(()),baseline=True,reset=True)
     observe(store,lambda:Snapshot((MovieRating(8,DATE,265189),)))
     first = apply_event(store,GLOBAL_TARGETS,event_id=1,expected_key=KEY,expected_rating=8,
                         expected_generation=4,expected_revision=5,confirmed=True)

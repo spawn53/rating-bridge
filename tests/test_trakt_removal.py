@@ -46,7 +46,7 @@ def store(tmp_path):
     hub.delete_rating(KEY, GLOBAL_TARGETS)
     mutate(inbound, "UPDATE outbox SET status='done'")
     observe(inbound, lambda: Snapshot(()), baseline=True)
-    for _ in range(2): observe(inbound, lambda: Snapshot(()))
+    for _ in range(2): observe(inbound, lambda: Snapshot(()), baseline=True, reset=True)
     for event_id, score in ((1, 8), (2, 9)):
         observe(inbound, lambda: Snapshot((MovieRating(score, DATE, 265189, 163864, 'tt2121382'),)))
         result = apply_event(inbound, GLOBAL_TARGETS, event_id=event_id, expected_key=KEY,

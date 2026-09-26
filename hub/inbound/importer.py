@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import json
 import re
 import sqlite3
-from typing import Iterable
+from typing import Callable, Iterable
 
 from hub.inbound.classification import classify, targets_excluding_source
 from hub.inbound.models import InboundError, MovieRating, timestamp
@@ -117,7 +117,8 @@ def _mark_applied(store: InboundStore, *, event_id: int, key: str, rating: int,
 
 def apply_event(store: InboundStore, targets: Iterable[str], *, event_id: int,
                 expected_key: str, expected_rating: int, expected_generation: int,
-                expected_revision: int, confirmed: bool = False) -> dict:
+                expected_revision: int, confirmed: bool = False,
+                automation_guard: Callable[[sqlite3.Connection], None] | None = None) -> dict:
     """Commit canonical/outbox together; then complete the replayable event audit.
 
     BEGIN IMMEDIATE holds validation through the canonical commit. A crash in
@@ -142,6 +143,8 @@ def apply_event(store: InboundStore, targets: Iterable[str], *, event_id: int,
     with store.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         event = _event(conn, event_id, expected_key, expected_rating, expected_generation)
+        if automation_guard is not None:
+            automation_guard(conn)
         if event["status"] == "applied":
             if event["canonical_revision"] != expected_revision + 1:
                 raise InboundError("Inbound applied revision did not match the expectation")

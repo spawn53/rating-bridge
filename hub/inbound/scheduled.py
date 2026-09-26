@@ -1,4 +1,4 @@
-"""One observe-only cycle with an OS lock. Recurrence belongs to systemd."""
+"""One poll and optional guarded apply under an OS lock; systemd owns recurrence."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -33,7 +33,10 @@ def scheduled_lock(db_path: str) -> Iterator[bool]:
         os.close(fd)
 
 
-def scheduled_observe(db_path: str, read: Callable[[], Snapshot], *, enabled: bool) -> dict:
+def scheduled_observe(db_path: str, read: Callable[[], Snapshot], *, enabled: bool,
+                      auto_apply_enabled: bool = False, max_events: int = 10,
+                      echo_grace_seconds: int = 600,
+                      targets: tuple[str, ...] = ("tmdb", "trakt", "simkl", "mdblist")) -> dict:
     if enabled is not True:
         raise InboundError("Scheduled observation requires inbound enabled")
     with scheduled_lock(db_path) as acquired:
@@ -43,4 +46,11 @@ def scheduled_observe(db_path: str, read: Callable[[], Snapshot], *, enabled: bo
         # Existing observe enforces a trusted baseline and atomic generation CAS.
         from hub.inbound.trakt import observe
         result = observe(store, read)
-        return {**result, "skipped_overlap": False}
+        from hub.inbound.auto_apply import auto_apply, counters, AutoApplyError
+        try:
+            applied = (auto_apply(store, targets, generation=result["generation"],
+                                  max_events=max_events, echo_grace_seconds=echo_grace_seconds)
+                       if auto_apply_enabled is True else counters(False))
+        except AutoApplyError as exc:
+            raise AutoApplyError({**result, **exc.result, "skipped_overlap": False}) from None
+        return {**result, **applied, "skipped_overlap": False}

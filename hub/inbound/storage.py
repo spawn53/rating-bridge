@@ -182,6 +182,15 @@ class InboundStore:
                     raise InboundError("Trakt baseline already exists; use --baseline --reset explicitly")
             elif state is None:
                 raise InboundError("Trakt baseline is missing; run --baseline first")
+            if not baseline and snapshot.snapshot_hash == state["snapshot_hash"]:
+                conn.execute("""
+                    UPDATE inbound_state SET last_successful_poll_at=?,observed_count=?,skipped_count=?
+                    WHERE provider=? AND media_type=?
+                """, (now, snapshot.movies, len(snapshot.unmapped), PROVIDER, MEDIA))
+                return {**counts, "events": 0, "movies": snapshot.movies,
+                        "eligible": len(snapshot.eligible), "skipped": len(snapshot.unmapped),
+                        "snapshot_hash": snapshot.snapshot_hash, "generation": generation,
+                        "snapshot_changed": False, "canonical_mutations": 0, "provider_writes": 0}
             version = (generation or 0) + 1
             previous = {r["content_key"]: dict(r) for r in conn.execute(
                 "SELECT * FROM inbound_snapshots WHERE provider=? AND media_type=?", (PROVIDER, MEDIA)
@@ -234,4 +243,4 @@ class InboundStore:
         return {**counts, "events": sum(counts[k] for k in ("added", "changed", "removed")),
                 "movies": snapshot.movies, "eligible": len(snapshot.eligible),
                 "skipped": len(snapshot.unmapped), "snapshot_hash": snapshot.snapshot_hash,
-                "generation": version, "canonical_mutations": 0, "provider_writes": 0}
+                "generation": version, "snapshot_changed": True, "canonical_mutations": 0, "provider_writes": 0}
