@@ -1,0 +1,18 @@
+[Unit]
+Description=Rating Hub Trakt movie observation (no automatic apply)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/srv/stacks/rating-hub
+ExecStart=/usr/bin/docker compose -f /srv/stacks/rating-hub/docker-compose.v2.yml run --rm --no-deps -T rating-hub python -m hub.inbound.trakt --scheduled-observe
+TimeoutStartSec=120
+Restart=no
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rating-hub-trakt-inbound

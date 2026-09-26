@@ -1,0 +1,12 @@
+[Unit]
+Description=Observe Trakt movie ratings every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=1s
+Persistent=true
+Unit=rating-hub-trakt-inbound.service
+
+[Install]
+WantedBy=timers.target

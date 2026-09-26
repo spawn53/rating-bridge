@@ -42,10 +42,25 @@ CREATE TABLE IF NOT EXISTS inbound_events (
 class InboundStore:
     """Owns only inbound tables. Canonical/outbox access is SELECT-only."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, initialize: bool = True):
         self.path = path
+        self._existing_only = not initialize
         if path == ":memory:":
             raise InboundError("Inbound observation requires a persistent SQLite path")
+        if not initialize:
+            # Scheduled observation must never create or migrate missing tables.
+            with self.connect() as conn:
+                required = {
+                    "inbound_state": "provider,media_type,baseline_created_at,last_successful_poll_at,snapshot_hash,generation,observed_count,skipped_count",
+                    "inbound_snapshots": "provider,media_type,content_key,rating,rated_at,tmdb_id,trakt_id,imdb_id,observed_at",
+                    "inbound_unmapped": "provider,media_type,ordinal,rating,rated_at,trakt_id,imdb_id,observed_at",
+                    "inbound_events": "id,fingerprint,provider,media_type,content_key,generation,event_type,old_rating,new_rating,provider_rated_at,detected_at,status,reason,classification,future_action,applied_at,canonical_revision",
+                    "ratings": "content_key,media_type,rating,revision,deleted",
+                    "outbox": "id,content_key,target,action,payload_json,revision,status",
+                }
+                for table, columns in required.items():
+                    conn.execute(f"SELECT {columns} FROM {table} LIMIT 0")
+            return
         Path(path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
             conn.executescript("""
@@ -120,7 +135,11 @@ class InboundStore:
                          (sequence[0],))
 
     def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=30)
+        if self._existing_only:
+            conn = sqlite3.connect(Path(self.path).expanduser().resolve().as_uri() + "?mode=rw",
+                                   uri=True, timeout=30)
+        else:
+            conn = sqlite3.connect(self.path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=30000")
         return conn

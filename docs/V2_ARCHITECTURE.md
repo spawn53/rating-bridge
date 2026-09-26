@@ -284,3 +284,51 @@ TMDb authenticated rating surfaces must agree and watchlist remain false;
 Simkl must remain uniquely present with its completed library status; MDBList
 must be absent from ratings. A final read checks Trakt remains unrated. A failed
 downstream delivery leaves the tombstone intact for outbox convergence.
+
+
+### Phase 5I: recurring observe-only Trakt movie polling
+
+`python -m hub.inbound.trakt --scheduled-observe` performs exactly one poll and
+exits. It requires `TRAKT_INBOUND_ENABLED=true` and the existing trusted baseline
+and current schema. It does not initialize/migrate tables, create/reset a
+baseline, or invoke any import or reclassification command. Safe source defaults
+remain disabled, movie-only and 300 seconds. No auto-apply flag or path is added.
+
+A nonblocking OS `flock` on the database directory's `trakt-inbound.lock`
+(`/data/trakt-inbound.lock` in Compose, `/srv/data/rating-hub/trakt-inbound.lock`
+on the VPS) covers baseline loading, complete fetch, validation and publication.
+An overlap exits successfully with a sanitized skip and no database mutations.
+The lock inode is retained; completion, exception or process exit releases the
+kernel lock without stale PID cleanup. SQLite still protects manual imports.
+
+Scheduled success logs only generation, delta counts, and zero mutation counts.
+Failures use a fixed sanitized message and nonzero exit. Existing atomic
+publication retains trusted state on malformed/incomplete/failed reads and
+SQLite failure; generation advances once for each successful poll, including
+unchanged snapshots. New candidates remain observed; echoes/noops remain ignored.
+Existing applied audit is untouched. OAuth refresh continues through the normal
+provider lifecycle; secrets and response histories are never logged.
+
+Repository-managed units are in `deploy/systemd/`. Install both files into
+`/etc/systemd/system/` and run `sudo systemctl daemon-reload`. The oneshot runs as
+`ubuntu` through the deployed Compose image and its existing environment; units
+contain no credentials. Systemd enforces one active instance; the persistent
+storage lock also protects direct overlapping CLI invocations. `Restart=no`
+prevents failure loops, and a 120-second start timeout bounds the oneshot.
+
+Before enabling the timer, take a mode-0600 SQLite API backup, set only
+`TRAKT_INBOUND_ENABLED=true` in `/srv/stacks/rating-hub/.env.v2` while preserving
+owner/mode and outbound targets, and validate one service start with
+`sudo systemctl start rating-hub-trakt-inbound.service`. Compare deterministic
+ratings/outbox hashes and event audit before/after. Then enable with
+`sudo systemctl enable --now rating-hub-trakt-inbound.timer` and verify two real
+timer activations, zero canonical/outbox/provider side effects and sanitized
+journal output. To stop recurrence, disable/stop the timer; keep manual import
+commands separate and operator-confirmed.
+
+The timer uses `OnBootSec=2min`, `OnUnitActiveSec=5min`, `AccuracySec=1s` and
+`Persistent=true`. Cadence is owned by the timer, not by an internal Python loop
+or the configuration's poll-seconds value. Each activation performs one poll;
+there is no missed-interval replay loop. `Persistent=true` affects calendar
+timers; this monotonic timer instead gets one overdue boot activation after
+startup, then resumes five-minute recurrence. No automatic application runs.

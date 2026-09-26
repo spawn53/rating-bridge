@@ -117,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--baseline", action="store_true")
     mode.add_argument("--once", action="store_true")
+    mode.add_argument("--scheduled-observe", action="store_true")
     mode.add_argument("--apply-event", type=int)
     mode.add_argument("--reclassify-event", type=int)
     mode.add_argument("--apply-removal-event", type=int)
@@ -141,7 +142,13 @@ def main(argv: list[str] | None = None) -> int:
                            args.expect_event_type, args.expect_old_rating,
                            args.expect_canonical_revision)
     repair_only = (args.expect_event_type, args.expect_old_rating)
-    if removing:
+    if args.scheduled_observe:
+        if (any(x is not None for x in expectations + repair_only)
+                or args.expect_canonical_source is not None or args.confirm_live_import
+                or args.confirm_reclassification or args.observe_only or args.reset):
+            print("Trakt scheduled observation refused: incompatible command flags")
+            return 2
+    elif removing:
         required = (args.expect_content_key, args.expect_generation, args.expect_old_rating,
                     args.expect_canonical_revision, args.expect_canonical_source)
         if (not args.confirm_live_import or any(x is None for x in required)
@@ -168,11 +175,26 @@ def main(argv: list[str] | None = None) -> int:
         print("Trakt observer refused: use --baseline [--reset] or --once --observe-only")
         return 2
     try:
-        InboundSettings.from_env()
+        inbound_settings = InboundSettings.from_env()
         # The explicit manual modes remain available while automatic inbound is disabled.
         from hub.providers.registry import get_provider
         from hub.settings import HubSettings
         settings = HubSettings.from_env()
+        if args.scheduled_observe:
+            from hub.inbound.scheduled import scheduled_observe
+            def read_scheduled() -> Snapshot:
+                with httpx.Client(timeout=10.0, follow_redirects=False) as client:
+                    return fetch_snapshot(get_provider("trakt"), client)
+            result = scheduled_observe(settings.db_path, read_scheduled, enabled=inbound_settings.enabled)
+            if result["skipped_overlap"]:
+                print("Trakt scheduled observation skipped: another instance is active")
+            else:
+                print("Trakt scheduled observation complete")
+                for key in ("generation", "added", "changed", "removed", "deferred"):
+                    print(f"{key}={result[key]}")
+            print("canonical_mutations=0")
+            print("provider_writes=0")
+            return 0
         store = InboundStore(settings.db_path)
         if removing:
             from hub.inbound.removal import apply_removal_event
@@ -233,10 +255,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except InboundError as exc:
         # Only this module's fixed local messages may reach operator output.
-        print(str(exc))
+        print("Trakt scheduled observation failed; trusted state retained" if args.scheduled_observe
+              else str(exc))
         return 1
     except Exception:
-        if removing:
+        if args.scheduled_observe:
+            print("Trakt scheduled observation failed; trusted state retained")
+        elif removing:
             print("Trakt removal command failed; inspect canonical/event audit before retrying")
         elif reclassifying:
             print("Trakt event reclassification failed; no automatic retry")
