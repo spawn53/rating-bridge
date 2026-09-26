@@ -109,9 +109,10 @@ the episode UI or post-play flow. Nuvio sends one request only: to Rating Hub.
 
 Outbound is **Hub canonical → providers**. Inbound is **provider watcher →
 canonical candidate**. The inbound tables are independent of canonical ratings
-and the transactional outbox. Phase 5A is **OBSERVE ONLY**, movies only, with
-manual baseline and manual polling. There are no canonical imports, recurring
-Compose services, or timers.
+and the transactional outbox. Baseline and observer commands remain **OBSERVE
+ONLY**, movies only, with manual baseline and manual polling. Phase 5C adds an
+explicitly confirmed importer for one persisted event. There are no recurring
+Compose services, timers, bulk imports, or automatic applications.
 
 Use the existing authenticated Trakt account to fetch all movie-rating pages:
 
@@ -138,20 +139,59 @@ updates the trusted snapshot without generating a rating-change event.
 
 The pure classifier labels same-as-canonical scores and matching completed
 Trakt outbound jobs as echo candidates, defers pending/processing/failed Trakt
-jobs, and identifies differing ratings as candidates for a future importer.
+jobs, and identifies differing ratings as candidates for the guarded manual importer.
 These hints do not prove user intent and are not authorization to import.
 Baseline-era removals without an active canonical rating cannot manufacture
 canonical tombstones or provider remove jobs.
 
-The loop rule for any future applied event is: **the origin provider is never an
+The loop rule for any applied event is: **the origin provider is never an
 outbound target for that imported event**. With normal production targets
-`tmdb,trakt,simkl,mdblist`, Trakt-originated events would use
+`tmdb,trakt,simkl,mdblist`, Trakt-originated events use
 `targets_excluding_source(settings.targets, "trakt")`, yielding
 `tmdb,simkl,mdblist`. Ordinary Nuvio writes retain all four targets.
 
 `TRAKT_INBOUND_ENABLED=false`, `TRAKT_INBOUND_MEDIA_TYPES=movie` and
 `TRAKT_INBOUND_POLL_SECONDS=300` are safe source defaults. Explicit manual
-observer commands work while automatic inbound is disabled. Enabling that flag
-does not install a service or provide an apply mode. Phase 5A event statuses are
-only `observed` or `ignored`; never `applied`. Tokens, titles, complete histories
-and raw provider bodies are excluded from logs and inbound audit metadata.
+commands work while automatic inbound is disabled. Enabling that flag
+does not install a service or automatically apply anything. The event table
+supports `observed`, `ignored`, and `applied`, with `applied_at` and
+`canonical_revision` for successful imports. Its transactional migration
+preserves every existing event field, ID, fingerprint, and AUTOINCREMENT
+sequence; the snapshot and generation tables are unchanged. Tokens, titles,
+complete histories and raw provider bodies are excluded from logs and inbound
+audit metadata.
+
+
+### Phase 5C: explicitly import one observed Trakt movie event
+
+```bash
+python -m hub.inbound.trakt --apply-event 1 \
+  --expect-content-key movie:tmdb:265189 --expect-rating 8 \
+  --expect-generation 4 --expect-canonical-revision 5 \
+  --confirm-live-import
+```
+
+The generation and canonical revision are required operator expectations. All
+expectations and the explicit confirmation must be supplied; they cannot be
+mixed with baseline/reset/observer flags. Removed events are unsupported.
+The importer performs no HTTP/provider calls. Normal outbox workers deliver
+exactly `tmdb,simkl,mdblist`; global targets still include Trakt.
+
+Under `BEGIN IMMEDIATE`, the importer revalidates the exact persisted event,
+current generation, matching score/timestamp/movie identity in the trusted
+snapshot, absence of superseding events, canonical revision/state, and current
+Trakt outbound classification. Pending/processing/failed Trakt jobs refuse
+import. An added event requires absent or tombstoned canonical state; a changed
+event requires the active canonical score to equal the event's old score.
+No candidate classification alone can bypass these checks.
+
+The existing canonical upsert runs inside that same write transaction and
+commits one revision with three unique delivery jobs. Source provenance is
+`trakt-inbound:<event_id>` and the provider timestamp is retained. After commit,
+a separate transaction marks the event applied. If the process stops in that
+gap, replay recognizes only the exact provenance, revision, identities,
+timestamp and full three-job payload audit; it marks the original revision
+applied without another canonical revision or job. An already-applied event
+returns its audited original revision without changing later canonical state.
+Incompatible state refuses replay. Failed downstream delivery leaves canonical
+state and outbox convergence intact; the importer does not undo user ratings.

@@ -13,6 +13,31 @@ from hub.inbound.models import InboundError, MovieRating, Snapshot
 PROVIDER = "trakt"
 MEDIA = "movie"
 
+EVENT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS inbound_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint TEXT NOT NULL UNIQUE,
+    provider TEXT NOT NULL,
+    media_type TEXT NOT NULL CHECK(media_type='movie'),
+    content_key TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    event_type TEXT NOT NULL CHECK(event_type IN ('added','changed','removed')),
+    old_rating INTEGER,
+    new_rating INTEGER,
+    provider_rated_at TEXT NOT NULL,
+    detected_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('observed','ignored','applied')),
+    reason TEXT NOT NULL,
+    classification TEXT NOT NULL,
+    future_action TEXT,
+    applied_at TEXT,
+    canonical_revision INTEGER,
+    CHECK((status='applied' AND applied_at IS NOT NULL
+        AND canonical_revision IS NOT NULL AND canonical_revision > 0)
+        OR (status!='applied' AND applied_at IS NULL AND canonical_revision IS NULL))
+);
+"""
+
 
 class InboundStore:
     """Owns only inbound tables. Canonical/outbox access is SELECT-only."""
@@ -58,24 +83,41 @@ class InboundStore:
                     observed_at TEXT NOT NULL,
                     PRIMARY KEY(provider,media_type,ordinal)
                 );
-                CREATE TABLE IF NOT EXISTS inbound_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    fingerprint TEXT NOT NULL UNIQUE,
-                    provider TEXT NOT NULL,
-                    media_type TEXT NOT NULL CHECK(media_type='movie'),
-                    content_key TEXT NOT NULL,
-                    generation INTEGER NOT NULL,
-                    event_type TEXT NOT NULL CHECK(event_type IN ('added','changed','removed')),
-                    old_rating INTEGER,
-                    new_rating INTEGER,
-                    provider_rated_at TEXT NOT NULL,
-                    detected_at TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK(status IN ('observed','ignored')),
-                    reason TEXT NOT NULL,
-                    classification TEXT NOT NULL,
-                    future_action TEXT
-                );
             """)
+            self._migrate_events(conn)
+
+    @staticmethod
+    def _migrate_events(conn: sqlite3.Connection) -> None:
+        # Serialize schema checks too: concurrent constructors must not rebuild twice.
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='inbound_events'"
+        ).fetchone()
+        if existing is None:
+            conn.execute(EVENT_SCHEMA)
+            return
+        columns = [r[1] for r in conn.execute("PRAGMA table_info(inbound_events)")]
+        if "'applied'" in existing[0] and {"applied_at", "canonical_revision"} <= set(columns):
+            return
+        expected = {
+            "id", "fingerprint", "provider", "media_type", "content_key", "generation",
+            "event_type", "old_rating", "new_rating", "provider_rated_at", "detected_at",
+            "status", "reason", "classification", "future_action", "applied_at",
+            "canonical_revision",
+        }
+        if set(columns) - expected:
+            raise InboundError("Inbound event schema was not recognized; migration refused")
+        sequence = conn.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name='inbound_events'"
+        ).fetchone()
+        conn.execute(EVENT_SCHEMA.replace("inbound_events", "inbound_events_migration", 1))
+        names = ",".join(columns)  # Restricted to the fixed column whitelist above.
+        conn.execute(f"INSERT INTO inbound_events_migration ({names}) SELECT {names} FROM inbound_events")
+        conn.execute("DROP TABLE inbound_events")
+        conn.execute("ALTER TABLE inbound_events_migration RENAME TO inbound_events")
+        if sequence is not None:
+            conn.execute("UPDATE sqlite_sequence SET seq=MAX(seq,?) WHERE name='inbound_events'",
+                         (sequence[0],))
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30)

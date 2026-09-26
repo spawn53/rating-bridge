@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -178,10 +179,17 @@ class RatingStore:
                 queued.append(target)
         return queued
 
-    def upsert_rating(self, item: RatingWrite, targets: Iterable[str]) -> dict[str, Any]:
+    def upsert_rating(
+        self, item: RatingWrite, targets: Iterable[str], *,
+        connection: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
+        """Upsert atomically, optionally inside a caller-owned write transaction."""
         now = _now()
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with (self._connect() if connection is None else nullcontext(connection)) as conn:
+            if connection is None:
+                conn.execute("BEGIN IMMEDIATE")
+            elif not conn.in_transaction:
+                raise RuntimeError("Canonical upsert requires an active transaction")
             row = conn.execute(
                 "SELECT * FROM ratings WHERE content_key = ?", (item.content_key,)
             ).fetchone()

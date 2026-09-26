@@ -1,4 +1,4 @@
-"""Manual movie-only baseline/observer. No import mode or scheduling entrypoint."""
+"""Manual movie observation and guarded single-event import. No scheduling."""
 from __future__ import annotations
 
 import argparse
@@ -113,15 +113,30 @@ def observe(store: InboundStore, read: Callable[[], Snapshot], *,
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Trakt inbound observer: no canonical imports")
+    parser = argparse.ArgumentParser(description="Manual Trakt observation or explicitly confirmed single-event import")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--baseline", action="store_true")
     mode.add_argument("--once", action="store_true")
+    mode.add_argument("--apply-event", type=int)
+    parser.add_argument("--expect-content-key")
+    parser.add_argument("--expect-rating", type=int)
+    parser.add_argument("--expect-generation", type=int)
+    parser.add_argument("--expect-canonical-revision", type=int)
+    parser.add_argument("--confirm-live-import", action="store_true")
     parser.add_argument("--observe-only", action="store_true")
     parser.add_argument("--reset", action="store_true")
     args = parser.parse_args(argv)
-    if (args.once and (not args.observe_only or args.reset)
-            or args.baseline and args.observe_only or args.reset and not args.baseline):
+    applying = args.apply_event is not None
+    expectations = (args.expect_content_key, args.expect_rating,
+                    args.expect_generation, args.expect_canonical_revision)
+    if applying:
+        if (not args.confirm_live_import or any(x is None for x in expectations)
+                or args.observe_only or args.reset):
+            print("Trakt import refused: require confirmation and explicit key/rating/generation/revision expectations")
+            return 2
+    elif (any(x is not None for x in expectations) or args.confirm_live_import
+          or args.once and (not args.observe_only or args.reset)
+          or args.baseline and args.observe_only or args.reset and not args.baseline):
         print("Trakt observer refused: use --baseline [--reset] or --once --observe-only")
         return 2
     try:
@@ -129,7 +144,23 @@ def main(argv: list[str] | None = None) -> int:
         # The explicit manual modes remain available while automatic inbound is disabled.
         from hub.providers.registry import get_provider
         from hub.settings import HubSettings
-        store = InboundStore(HubSettings.from_env().db_path)
+        settings = HubSettings.from_env()
+        store = InboundStore(settings.db_path)
+        if applying:
+            from hub.inbound.importer import apply_event
+            result = apply_event(
+                store, settings.targets, event_id=args.apply_event,
+                expected_key=args.expect_content_key, expected_rating=args.expect_rating,
+                expected_generation=args.expect_generation,
+                expected_revision=args.expect_canonical_revision,
+                confirmed=args.confirm_live_import,
+            )
+            print("Trakt inbound single-event import complete")
+            for key in ("event_id", "content_key", "rating", "revision", "queued_targets",
+                        "skipped_targets", "already_applied"):
+                print(f"{key}={result[key]}")
+            print("direct_provider_writes=0")
+            return 0
         with httpx.Client(timeout=10.0, follow_redirects=False) as client:
             result = observe(store, lambda: fetch_snapshot(get_provider("trakt"), client),
                              baseline=args.baseline, reset=args.reset)
@@ -145,7 +176,8 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc))
         return 1
     except Exception:
-        print("Trakt inbound observation failed; trusted snapshot retained")
+        print("Trakt inbound command failed; inspect canonical/event audit before retrying" if applying
+              else "Trakt inbound observation failed; trusted snapshot retained")
         return 1
 
 
