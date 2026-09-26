@@ -310,8 +310,8 @@ def test_repeated_real_score_cycles_preserve_distinct_occurrences(store):
     assert len(events) == len({e["fingerprint"] for e in events}) == 3
 
 
-def canonical(rating=8, deleted=0):
-    return {"rating": rating, "deleted": deleted}
+def canonical(rating=8, deleted=0, revision=1):
+    return {"rating": rating, "deleted": deleted, "revision": revision}
 
 
 def job(status="done", score=9, action="upsert", revision=1, identity=1):
@@ -335,8 +335,8 @@ def test_unsettled_outbox_deferred(status):
 
 
 def test_latest_completed_echo_and_older_job_not_selected():
-    assert classify(KEY, 9, canonical(), [job(score=7), job(score=9, revision=2, identity=2)]).kind == "echo"
-    assert classify(KEY, 7, canonical(), [job(score=7), job(score=9, revision=2, identity=2)]).kind == "candidate"
+    assert classify(KEY, 9, canonical(revision=2), [job(score=7), job(score=9, revision=2, identity=2)]).kind == "echo"
+    assert classify(KEY, 7, canonical(revision=2), [job(score=7), job(score=9, revision=2, identity=2)]).kind == "candidate"
 
 
 def test_completed_remove_can_be_an_echo():

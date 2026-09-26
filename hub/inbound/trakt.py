@@ -113,11 +113,15 @@ def observe(store: InboundStore, read: Callable[[], Snapshot], *,
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Manual Trakt observation or explicitly confirmed single-event import")
+    parser = argparse.ArgumentParser(description="Manual Trakt observation or explicitly confirmed single-event operations")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--baseline", action="store_true")
     mode.add_argument("--once", action="store_true")
     mode.add_argument("--apply-event", type=int)
+    mode.add_argument("--reclassify-event", type=int)
+    parser.add_argument("--expect-event-type", choices=("removed",))
+    parser.add_argument("--expect-old-rating", type=int)
+    parser.add_argument("--confirm-reclassification", action="store_true")
     parser.add_argument("--expect-content-key")
     parser.add_argument("--expect-rating", type=int)
     parser.add_argument("--expect-generation", type=int)
@@ -127,14 +131,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reset", action="store_true")
     args = parser.parse_args(argv)
     applying = args.apply_event is not None
+    reclassifying = args.reclassify_event is not None
     expectations = (args.expect_content_key, args.expect_rating,
                     args.expect_generation, args.expect_canonical_revision)
+    repair_expectations = (args.expect_content_key, args.expect_generation,
+                           args.expect_event_type, args.expect_old_rating,
+                           args.expect_canonical_revision)
+    repair_only = (args.expect_event_type, args.expect_old_rating)
     if applying:
         if (not args.confirm_live_import or any(x is None for x in expectations)
-                or args.observe_only or args.reset):
+                or args.observe_only or args.reset or args.confirm_reclassification
+                or any(x is not None for x in repair_only)):
             print("Trakt import refused: require confirmation and explicit key/rating/generation/revision expectations")
             return 2
-    elif (any(x is not None for x in expectations) or args.confirm_live_import
+    elif reclassifying:
+        if (not args.confirm_reclassification or any(x is None for x in repair_expectations)
+                or args.expect_rating is not None or args.confirm_live_import
+                or args.observe_only or args.reset):
+            print("Trakt reclassification refused: require confirmation and explicit key/generation/type/old-rating/revision expectations")
+            return 2
+    elif (any(x is not None for x in expectations + repair_only)
+          or args.confirm_live_import or args.confirm_reclassification
           or args.once and (not args.observe_only or args.reset)
           or args.baseline and args.observe_only or args.reset and not args.baseline):
         print("Trakt observer refused: use --baseline [--reset] or --once --observe-only")
@@ -146,6 +163,25 @@ def main(argv: list[str] | None = None) -> int:
         from hub.settings import HubSettings
         settings = HubSettings.from_env()
         store = InboundStore(settings.db_path)
+        if reclassifying:
+            from hub.inbound.reclassification import reclassify_event
+            result = reclassify_event(
+                store, event_id=args.reclassify_event, expected_key=args.expect_content_key,
+                expected_generation=args.expect_generation, expected_event_type=args.expect_event_type,
+                expected_old_rating=args.expect_old_rating,
+                expected_revision=args.expect_canonical_revision,
+                confirmed=args.confirm_reclassification,
+            )
+            print("Trakt inbound single-event reclassification complete")
+            for key in ("event_id", "content_key", "generation"):
+                print(f"{key}={result[key]}")
+            for label in ("old", "new"):
+                for field in ("status", "classification", "reason"):
+                    print(f"{label}_{field}={result[label][field]}")
+            print(f"future_action={result['new']['future_action']}")
+            for key in ("already_reclassified", "canonical_mutations", "outbox_mutations", "provider_writes"):
+                print(f"{key}={result[key]}")
+            return 0
         if applying:
             from hub.inbound.importer import apply_event
             result = apply_event(
@@ -176,8 +212,11 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc))
         return 1
     except Exception:
-        print("Trakt inbound command failed; inspect canonical/event audit before retrying" if applying
-              else "Trakt inbound observation failed; trusted snapshot retained")
+        if reclassifying:
+            print("Trakt event reclassification failed; no automatic retry")
+        else:
+            print("Trakt inbound command failed; inspect canonical/event audit before retrying" if applying
+                  else "Trakt inbound observation failed; trusted snapshot retained")
         return 1
 
 

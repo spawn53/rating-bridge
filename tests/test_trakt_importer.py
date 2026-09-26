@@ -127,7 +127,7 @@ def test_partial_commit_replay_requires_exact_provenance_and_delivery_audit(stor
     if corruption == "revision": mutate(store, "UPDATE ratings SET revision=7")
     if corruption == "target": mutate(store, "UPDATE outbox SET target='trakt' WHERE revision=6 AND target='tmdb'")
     if corruption == "payload": mutate(store, "UPDATE outbox SET payload_json='{}' WHERE revision=6 AND target='tmdb'")
-    if corruption == "trakt_job": mutate(store, "UPDATE outbox SET status='pending' WHERE target='trakt' AND revision=5")
+    if corruption == "trakt_job": mutate(store, "UPDATE outbox SET status='pending',revision=6 WHERE target='trakt' AND revision=5")
     before = dump(store)
     with pytest.raises(InboundError): apply(store)
     assert dump(store) == before

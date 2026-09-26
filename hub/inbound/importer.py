@@ -72,8 +72,10 @@ def _snapshot(conn: sqlite3.Connection, event: dict) -> MovieRating:
 def _verify_committed(conn: sqlite3.Connection, event: dict, movie: MovieRating,
                       expected_revision: int) -> dict:
     canonical, trakt_jobs = InboundStore._context(conn, event["content_key"])
-    if any(j["status"] in {"pending", "processing", "failed"} for j in trakt_jobs):
-        raise InboundError("Trakt outbound work is unresolved; import refused")
+    # Apply the same causal scope during crash recovery as before first import.
+    decision = classify(event["content_key"], movie.rating, canonical, trakt_jobs)
+    if decision.kind == "defer":
+        raise InboundError("Trakt outbound audit is unresolved or inconsistent; import refused")
     if (canonical is None or canonical["deleted"] != 0
             or canonical["source"] != f"trakt-inbound:{event['id']}"
             or canonical["revision"] != expected_revision + 1

@@ -138,8 +138,13 @@ published snapshot produces no duplicate events. A timestamp-only change
 updates the trusted snapshot without generating a rating-change event.
 
 The pure classifier labels same-as-canonical scores and matching completed
-Trakt outbound jobs as echo candidates, defers pending/processing/failed Trakt
-jobs, and identifies differing ratings as candidates for the guarded manual importer.
+Trakt outbound jobs as echo candidates and identifies differing ratings as
+candidates for the guarded manual importer. Outbound evidence is scoped to the
+current canonical revision: older jobs are history only, current unresolved
+jobs defer, and jobs ahead of canonical fail closed. Canonical and job revisions
+must be positive integers. Multiple current jobs are treated as ambiguous, and
+malformed current completed audit also defers. Without a canonical revision,
+existing outbound audit cannot safely establish causality.
 These hints do not prove user intent and are not authorization to import.
 Baseline-era removals without an active canonical rating cannot manufacture
 canonical tombstones or provider remove jobs.
@@ -195,3 +200,34 @@ applied without another canonical revision or job. An already-applied event
 returns its audited original revision without changing later canonical state.
 Incompatible state refuses replay. Failed downstream delivery leaves canonical
 state and outbox convergence intact; the importer does not undo user ratings.
+
+
+### Phase 5G: repair one historical-outbound echo classification
+
+```bash
+python -m hub.inbound.trakt --reclassify-event 3 \
+  --expect-content-key movie:tmdb:265189 --expect-generation 6 \
+  --expect-event-type removed --expect-old-rating 9 \
+  --expect-canonical-revision 7 --confirm-reclassification
+```
+
+An old Trakt removal from revision 5 cannot explain a user removal while
+canonical is active at revision 7. The same revision scope is used by importer
+crash recovery; a historical unresolved job cannot block a later committed
+inbound revision's audit completion.
+
+The manual repair supports only Trakt movie removals with the known false
+`ignored/echo/matches_latest_completed_trakt_job` signature. It requires valid
+event identity/timestamps, the explicit expected key/generation/old score and
+canonical revision, active canonical score matching the removal's old score,
+absence in the trusted snapshot at that generation, no superseding event,
+historical completed-removal evidence, and recomputation to exactly
+`candidate/different_provider_state/delete`. A single write transaction holds
+all checks through the update. Only status, classification, reason and future
+action change; all identity/transition fields and the snapshot remain intact.
+Repeat repair safely reports already reclassified after the same checks.
+
+Reclassification has no HTTP, canonical, or outbox write path. It does not run
+the observer, advance generation, reset a baseline, or import a removal. The
+existing importer still refuses removed events; delete import remains a
+separately authorized phase. Automatic inbound remains disabled.
