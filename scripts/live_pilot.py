@@ -18,6 +18,35 @@ class PilotBlocked(RuntimeError):
     pass
 
 
+_SAFE_PILOT_MESSAGES = {
+    'TMDb watchlist state is unsafe for a rating pilot':
+        'Pilot blocked: TMDb movie is currently in watchlist',
+    'TMDb account state was incomplete':
+        'Pilot blocked: TMDb account state could not be verified',
+    'TMDb rated value was missing':
+        'Pilot blocked: TMDb rated value was missing',
+    'TMDb rating was not a half-step value':
+        'Pilot blocked: TMDb rating was not a half-step value',
+    'provider rating response was not numeric':
+        'Pilot blocked: provider rating was not numeric',
+    'provider rating response was outside the expected scale':
+        'Pilot blocked: provider rating was outside the expected scale',
+    'pilot stopped after failed write or verification':
+        'Pilot stopped after a failed write or verification; original rating restoration verified',
+    'rollback could not be verified; manual review required':
+        'Pilot blocked: original rating restoration could not be verified',
+    'TMDb settle verifier is required':
+        'Pilot blocked: TMDb settle verification is unavailable',
+}
+
+
+def operator_failure(exc: Exception) -> str:
+    """Expose only fixed local safety reasons, never arbitrary exception text."""
+    if type(exc) is PilotBlocked:
+        return _SAFE_PILOT_MESSAGES.get(str(exc), 'Pilot blocked or failed; inspect state manually')
+    return 'Pilot blocked or failed; inspect state manually'
+
+
 class Delivery(Protocol):
     def deliver(self, action: str, payload: dict[str, object]) -> None: ...
 
@@ -47,13 +76,16 @@ def _json(response: object) -> object:
     return response.json()
 
 
-def read_state(name: str, tmdb_id: int, provider: object, client: object) -> State:
+def read_state(name: str, tmdb_id: int, provider: object, client: object,
+               timeout: float | None = None) -> State:
     """Read only documented GET endpoints; fail if absence is ambiguous."""
     if name == 'tmdb':
         from hub.providers.tmdb import BASE_URL
+        options = {'timeout': timeout} if timeout is not None else {}
         data = _json(client.get(
             f'{BASE_URL}/movie/{tmdb_id}/account_states',
             params={'session_id': provider.session_id}, headers=provider.headers,
+            **options,
         ))
         if (not isinstance(data, dict) or 'rated' not in data
                 or not isinstance(data.get('watchlist'), bool)):
@@ -160,10 +192,13 @@ def _ensure_safe(name: str, original: State, current: State) -> None:
 
 
 def pilot(name: str, payload: dict[str, object], provider: Delivery,
-          read: Callable[[], State], first: int = 7, second: int = 9) -> list[str]:
+          read: Callable[[], State], first: int = 7, second: int = 9, *,
+          verify: Callable[[float | None, State, bool], State] | None = None) -> list[str]:
     """Verify each transition and attempt rollback even after uncertain writes."""
     original = read()
     _ensure_safe(name, original, original)
+    if name == 'tmdb' and verify is None:
+        raise PilotBlocked('TMDb settle verifier is required')
     events = ['original state read']
     attempted = False
     failure: Exception | None = None
@@ -171,10 +206,16 @@ def pilot(name: str, payload: dict[str, object], provider: Delivery,
         for score in (first, second):
             attempted = True  # A timed-out write may have reached the provider.
             provider.deliver('upsert', {**payload, 'rating': score})
-            current = read()
-            _ensure_safe(name, original, current)
-            if current.rating != score:
-                raise PilotBlocked('provider verification disagreed with requested rating')
+            if name == 'tmdb':
+                current = verify(score, original, False)  # type: ignore[misc]
+                _ensure_safe(name, original, current)
+                if current.rating != score:
+                    raise PilotBlocked('provider settle verification returned an unexpected state')
+            else:
+                current = read()
+                _ensure_safe(name, original, current)
+                if current.rating != score:
+                    raise PilotBlocked('provider verification disagreed with requested rating')
             events.append(f'rating {score} verified')
     except Exception as exc:
         failure = exc
@@ -188,18 +229,28 @@ def pilot(name: str, payload: dict[str, object], provider: Delivery,
                         **payload, 'rating': original.rating,
                         'rated_at': original.rated_at,
                     })
-                restored = read()
-                _ensure_safe(name, original, restored)
-                if restored.rating != original.rating:
-                    raise PilotBlocked('original rating was not restored')
-                if (name == 'trakt' and original.rating is not None
-                        and restored.rated_at != original.rated_at):
-                    raise PilotBlocked('original Trakt rated_at was not restored')
+                if name == 'tmdb':
+                    restored = verify(original.rating, original, True)  # type: ignore[misc]
+                    _ensure_safe(name, original, restored)
+                    if restored.rating != original.rating:
+                        raise PilotBlocked('provider settle verification returned an unexpected state')
+                else:
+                    restored = read()
+                    _ensure_safe(name, original, restored)
+                    if restored.rating != original.rating:
+                        raise PilotBlocked('original rating was not restored')
+                    if (name == 'trakt' and original.rating is not None
+                            and restored.rated_at != original.rated_at):
+                        raise PilotBlocked('original Trakt rated_at was not restored')
                 events.append('original rating verified restored')
-            except Exception as exc:
+            except PilotBlocked as exc:
                 raise PilotBlocked('rollback could not be verified; manual review required') from exc
+            except Exception as exc:
+                raise RuntimeError('pilot rollback failed') from exc
     if failure is not None:
-        raise PilotBlocked('pilot stopped after failed write or verification') from failure
+        if type(failure) is PilotBlocked:
+            raise PilotBlocked('pilot stopped after failed write or verification') from failure
+        raise RuntimeError('pilot failed') from failure
     return events
 
 
@@ -243,14 +294,42 @@ def main(argv: list[str] | None = None) -> int:
         tmdb_id = int(match.group(1))
         payload = {'media_type': 'movie', 'tmdb_id': tmdb_id, 'content_key': args.content}
         with httpx.Client(timeout=10.0, follow_redirects=False) as client:
+            verify = None
+            if args.provider == 'tmdb':
+                from scripts.settle_verifier import (
+                    ROLLBACK_POLICY,
+                    UPSERT_POLICY,
+                    tmdb_account_id,
+                    tmdb_rated_movie_rating,
+                    wait_for_state,
+                )
+                account_id = tmdb_account_id(provider, client, 10.0)
+
+                def verify(expected: float | None, original: State,
+                           rollback: bool) -> State:
+                    return wait_for_state(
+                        'tmdb', original, expected,
+                        lambda remaining: read_state(
+                            'tmdb', tmdb_id, provider, client,
+                            timeout=min(10.0, remaining),
+                        ),
+                        policy=ROLLBACK_POLICY if rollback else UPSERT_POLICY,
+                        rollback=rollback,
+                        read_secondary=(
+                            lambda remaining: tmdb_rated_movie_rating(
+                                tmdb_id, account_id, provider, client, remaining,
+                            )
+                        ) if rollback else None,
+                    )
             events = pilot(args.provider, payload, provider,
-                           lambda: read_state(args.provider, tmdb_id, provider, client))
+                           lambda: read_state(args.provider, tmdb_id, provider, client),
+                           verify=verify)
         for event in events:
             print(event)
         return 0
     except Exception as exc:
         # HTTP exception text may include URLs, response bodies, or credentials.
-        print(f'Pilot blocked or failed ({type(exc).__name__}); inspect state manually')
+        print(operator_failure(exc))
         return 1
 
 
