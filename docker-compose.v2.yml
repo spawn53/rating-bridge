@@ -1,0 +1,38 @@
+services:
+  rating-hub:
+    image: nuvio-rating-hub:local
+    platform: linux/arm64
+    build:
+      context: .
+      dockerfile: Dockerfile.v2
+    container_name: rating-hub
+    restart: unless-stopped
+    env_file:
+      - .env.v2
+    environment:
+      RATING_HUB_DB: /data/rating-hub.sqlite3
+    volumes:
+      - /srv/data/rating-hub:/data
+    ports:
+      - "127.0.0.1:8787:8787"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  rating-hub-worker:
+    image: nuvio-rating-hub:local
+    platform: linux/arm64
+    container_name: rating-hub-worker
+    restart: unless-stopped
+    command: ["python", "-m", "hub.worker"]
+    env_file:
+      - .env.v2
+    environment:
+      RATING_HUB_DB: /data/rating-hub.sqlite3
+    volumes:
+      - /srv/data/rating-hub:/data
+    depends_on:
+      - rating-hub

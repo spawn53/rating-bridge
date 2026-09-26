@@ -1,0 +1,13 @@
+# Rating Hub V2 delivery semantics
+
+This phase is code and test only. It does not enable provider credentials or deploy to the VPS.
+
+- A canonical write and its outbox rows commit in one SQLite transaction. Writers use `BEGIN IMMEDIATE` so concurrent writes to one rating serialize. The first write starts at revision 1; changes and restoration after a tombstone increment the revision.
+- An identical write keeps its revision and original `rated_at`/`updated_at`. It adds only targets missing at that revision. It does not retry a failed target; an explicit retry mechanism would be separate. New metadata, a changed rating, source, or explicit `rated_at` creates a new revision. Omitted optional metadata is retained.
+- A delete leaves a tombstone with a new revision. Repeated deletes enqueue nothing. The remove payload carries the tombstone revision and a null rating.
+- A new revision atomically marks older pending jobs `superseded`. Claims also check the canonical revision and action under `BEGIN IMMEDIATE`, so recovered old jobs cannot be sent. The outbox API can list `superseded` rows with their reason, revision, target, and attempts.
+- At most one `processing` job per content key and target can be claimed. A newer job for that same pair waits until the older processing job finishes or its lease is recovered. This preserves remote delivery order if a canonical change occurs while an older provider call is in flight. Different targets remain independent.
+- A worker checks the revision both after claim and immediately before provider delivery. A canonical change after that final check can allow an already in-flight old call to finish, but the newer job stays blocked until it does, then converges the remote target to the newest state. This assumes provider requests terminate within the ten-minute stale lease; the adapters currently use 30-second HTTP timeouts. An external provider cannot offer exactly-once delivery through SQLite alone.
+- A transient failure schedules exponential backoff at 15, 30, 60 seconds and so on, capped at 3600 seconds. The eighth failed attempt is terminal. Unsupported or unconfigured providers fail immediately. Worker error state stores only the exception class to avoid persisting secrets echoed by providers.
+- Startup and the worker idle loop recover processing jobs older than ten minutes. Attempts act as a lease generation: a stale worker cannot complete a job after it has been reclaimed. The eighth expired processing attempt becomes failed.
+- Existing V2 outbox tables are migrated in place to accept `superseded`, retaining row IDs and history. This migration runs on next application startup; this phase does not restart the deployed containers.
