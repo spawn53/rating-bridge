@@ -414,8 +414,13 @@ python -m hub.inbound.trakt --baseline --media-type show
 python -m hub.inbound.trakt --once --observe-only --media-type show
 ```
 
-The default media selection remains movie. Show canonical import, removal import,
-reclassification, auto-apply and scheduled polling are disabled and fail closed.
+The default media selection remains movie. Guarded manual show added/changed
+imports use `--apply-event <id> --media-type show` with explicit key, rating,
+generation, existing revision and `--confirm-live-import` expectations. The shared
+movie/show importer commits canonical state and exactly three jobs (TMDb, Simkl,
+MDBList), excludes Trakt, and recovers audit-gap crashes only from exact
+provenance and canonical/outbox payload audit. Show removal import,
+reclassification, auto-apply and scheduled polling remain disabled and fail closed.
 Episode/season inbound observation is unsupported. Existing show ratings captured
 by the baseline are historical source state: they create no events, canonical
 ratings or outbox jobs and are never automatically backfilled.

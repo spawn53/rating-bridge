@@ -1,4 +1,4 @@
-"""Explicit, guarded import of one persisted Trakt movie event. No provider I/O."""
+"""Explicit, guarded import of one persisted Trakt movie/show upsert event. No provider I/O."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -8,7 +8,7 @@ import sqlite3
 from typing import Callable, Iterable
 
 from hub.inbound.classification import classify, targets_excluding_source
-from hub.inbound.models import InboundError, MovieRating, timestamp
+from hub.inbound.models import InboundError, MovieRating, ShowRating, timestamp, validate_media_type
 from hub.inbound.storage import InboundStore
 from hub.models import RatingWrite
 from hub.store import RatingStore
@@ -18,12 +18,14 @@ GLOBAL_TARGETS = ("tmdb", "trakt", "simkl", "mdblist")
 
 
 def _event(conn: sqlite3.Connection, event_id: int, key: str, rating: int,
-           generation: int) -> dict:
+           generation: int, media_type: str = "movie") -> dict:
+    validate_media_type(media_type)
     row = conn.execute("SELECT * FROM inbound_events WHERE id=?", (event_id,)).fetchone()
     if row is None:
         raise InboundError("Inbound event was not found")
     event = dict(row)
-    if (event["provider"] != "trakt" or event["media_type"] != "movie"
+    if (event["provider"] != "trakt" or event["media_type"] != media_type
+            or not re.fullmatch(rf"{media_type}:tmdb:[1-9][0-9]*", key)
             or event["content_key"] != key or event["new_rating"] != rating
             or event["generation"] != generation
             or event["event_type"] not in {"added", "changed"}
@@ -42,18 +44,21 @@ def _event(conn: sqlite3.Connection, event_id: int, key: str, rating: int,
     return event
 
 
-def _snapshot(conn: sqlite3.Connection, event: dict) -> MovieRating:
+def _snapshot(conn: sqlite3.Connection, event: dict) -> MovieRating | ShowRating:
     key = event["content_key"]
+    media_type = validate_media_type(event["media_type"])
     state = conn.execute(
-        "SELECT generation FROM inbound_state WHERE provider='trakt' AND media_type='movie'"
+        "SELECT generation FROM inbound_state WHERE provider='trakt' AND media_type=?",
+        (media_type,),
     ).fetchone()
     row = conn.execute(
-        "SELECT * FROM inbound_snapshots WHERE provider='trakt' AND media_type='movie' AND content_key=?",
-        (key,),
+        "SELECT * FROM inbound_snapshots WHERE provider='trakt' AND media_type=? AND content_key=?",
+        (media_type, key),
     ).fetchone()
     if state is None or state[0] != event["generation"] or row is None:
         raise InboundError("Inbound event no longer matches the trusted snapshot generation")
-    movie = MovieRating(row["rating"], row["rated_at"], row["tmdb_id"],
+    model = MovieRating if media_type == "movie" else ShowRating
+    movie = model(row["rating"], row["rated_at"], row["tmdb_id"],
                         row["trakt_id"], row["imdb_id"])
     if (movie.content_key != key or movie.rating != event["new_rating"]
             or movie.rated_at != timestamp(event["provider_rated_at"])):
@@ -61,15 +66,15 @@ def _snapshot(conn: sqlite3.Connection, event: dict) -> MovieRating:
     # Include ignored events: a newer echo/removal still supersedes old intent.
     newer = conn.execute("""
         SELECT 1 FROM inbound_events
-        WHERE provider='trakt' AND media_type='movie' AND content_key=?
+        WHERE provider='trakt' AND media_type=? AND content_key=?
           AND (generation>? OR (generation=? AND id>?)) LIMIT 1
-    """, (key, event["generation"], event["generation"], event["id"])).fetchone()
+    """, (media_type, key, event["generation"], event["generation"], event["id"])).fetchone()
     if newer is not None:
         raise InboundError("A newer inbound event supersedes this event")
     return movie
 
 
-def _verify_committed(conn: sqlite3.Connection, event: dict, movie: MovieRating,
+def _verify_committed(conn: sqlite3.Connection, event: dict, movie: MovieRating | ShowRating,
                       expected_revision: int) -> dict:
     canonical, trakt_jobs = InboundStore._context(conn, event["content_key"])
     # Apply the same causal scope during crash recovery as before first import.
@@ -79,7 +84,8 @@ def _verify_committed(conn: sqlite3.Connection, event: dict, movie: MovieRating,
     if (canonical is None or canonical["deleted"] != 0
             or canonical["source"] != f"trakt-inbound:{event['id']}"
             or canonical["revision"] != expected_revision + 1
-            or canonical["media_type"] != "movie"
+            or canonical["media_type"] != event["media_type"]
+            or canonical["content_key"] != event["content_key"]
             or canonical["rating"] != movie.rating or canonical["tmdb_id"] != movie.tmdb_id
             or (movie.trakt_id is not None and canonical["trakt_id"] != movie.trakt_id)
             or (movie.imdb_id is not None and canonical["imdb_id"] != movie.imdb_id)
@@ -99,7 +105,7 @@ def _mark_applied(store: InboundStore, *, event_id: int, key: str, rating: int,
                   generation: int, expected_revision: int, fingerprint: str) -> int:
     with store.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        event = _event(conn, event_id, key, rating, generation)
+        event = _event(conn, event_id, key, rating, generation, store.media_type)
         if event["fingerprint"] != fingerprint:
             raise InboundError("Inbound event identity changed before audit completion")
         movie = _snapshot(conn, event)
@@ -125,13 +131,12 @@ def apply_event(store: InboundStore, targets: Iterable[str], *, event_id: int,
     the following audit gap is recovered only by exact provenance and a complete
     three-job payload audit, never by score equality alone.
     """
-    if store.media_type != "movie":
-        raise InboundError("Show inbound observation is observe-only; mutation refused")
+    media_type = validate_media_type(store.media_type)
     if confirmed is not True:
         raise InboundError("Single-event import requires --confirm-live-import")
     if (type(event_id) is not int or event_id < 1
             or not isinstance(expected_key, str)
-            or not re.fullmatch(r"movie:tmdb:[1-9][0-9]*", expected_key)
+            or not re.fullmatch(rf"{media_type}:tmdb:[1-9][0-9]*", expected_key)
             or type(expected_rating) is not int or not 1 <= expected_rating <= 10
             or type(expected_generation) is not int or expected_generation < 1
             or type(expected_revision) is not int or expected_revision < 0):
@@ -144,7 +149,7 @@ def apply_event(store: InboundStore, targets: Iterable[str], *, event_id: int,
     replayed = False
     with store.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        event = _event(conn, event_id, expected_key, expected_rating, expected_generation)
+        event = _event(conn, event_id, expected_key, expected_rating, expected_generation, media_type)
         if automation_guard is not None:
             automation_guard(conn)
         if event["status"] == "applied":
@@ -167,9 +172,9 @@ def apply_event(store: InboundStore, targets: Iterable[str], *, event_id: int,
                     or decision.future_action != "upsert"):
                 raise InboundError("Current canonical/outbox classification refuses this import")
             revision = canonical["revision"] if canonical else 0
-            if canonical is not None and (canonical["media_type"] != "movie"
+            if canonical is not None and (canonical["media_type"] != event["media_type"]
                     or canonical["tmdb_id"] != movie.tmdb_id):
-                raise InboundError("Canonical movie identity is incompatible with the inbound event")
+                raise InboundError("Canonical media identity is incompatible with the inbound event")
             if revision != expected_revision:
                 raise InboundError("Canonical revision changed; import refused")
             if (event["event_type"] == "added" and canonical is not None
@@ -178,7 +183,7 @@ def apply_event(store: InboundStore, targets: Iterable[str], *, event_id: int,
             if (event["event_type"] == "changed" and (canonical is None
                     or canonical["deleted"] != 0 or canonical["rating"] != event["old_rating"])):
                 raise InboundError("Changed inbound event does not match previous canonical state")
-            item = RatingWrite(media_type="movie", tmdb_id=movie.tmdb_id,
+            item = RatingWrite(media_type=media_type, tmdb_id=movie.tmdb_id,
                                trakt_id=movie.trakt_id, imdb_id=movie.imdb_id,
                                rating=movie.rating, rated_at=datetime.fromisoformat(movie.rated_at),
                                source=f"trakt-inbound:{event_id}")

@@ -307,14 +307,14 @@ def test_show_candidate_removal_retains_active_canonical(store):
 
 def test_show_cannot_enter_any_mutation_engine(store):
     before=canonical_dump(store)
-    with pytest.raises(InboundError,match='observe-only'):apply_event(store,GLOBAL_TARGETS,event_id=1,expected_key='show:tmdb:123',expected_rating=8,expected_generation=1,expected_revision=0,confirmed=True)
+    with pytest.raises(InboundError,match='not found'):apply_event(store,GLOBAL_TARGETS,event_id=1,expected_key='show:tmdb:123',expected_rating=8,expected_generation=1,expected_revision=0,confirmed=True)
     with pytest.raises(InboundError,match='observe-only'):apply_removal_event(store,GLOBAL_TARGETS,event_id=1,expected_key='show:tmdb:123',expected_generation=1,expected_old_rating=9,expected_revision=1,expected_source='nuvio',confirmed=True)
     with pytest.raises(InboundError,match='observe-only'):reclassify_event(store,event_id=1,expected_key='show:tmdb:123',expected_generation=1,expected_event_type='removed',expected_old_rating=9,expected_revision=1,confirmed=True)
     with pytest.raises(AutoApplyError):auto_apply(store,GLOBAL_TARGETS,generation=1)
     assert canonical_dump(store)==before
 
 
-@pytest.mark.parametrize('argv',[['--apply-event','1'],['--apply-removal-event','1'],['--reclassify-event','1'],['--scheduled-observe']])
+@pytest.mark.parametrize('argv',[['--apply-removal-event','1'],['--reclassify-event','1'],['--scheduled-observe']])
 def test_show_cli_mutations_and_scheduler_refused_before_io(tmp_path,monkeypatch,argv,capsys):
     db=tmp_path/'must-not-exist.sqlite3';monkeypatch.setenv('RATING_HUB_DB',str(db))
     assert main([*argv,'--media-type','show'])==2 and not db.exists()
