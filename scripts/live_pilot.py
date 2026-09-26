@@ -56,6 +56,14 @@ _SAFE_PILOT_MESSAGES = {
         'Pilot blocked: Simkl original rating restoration could not be verified',
     'Simkl settle verifier is required':
         'Pilot blocked: Simkl settle verification is unavailable',
+    'MDBList rating state could not be verified':
+        'Pilot blocked: MDBList rating state could not be verified',
+    'MDBList original rating restoration could not be verified':
+        'Pilot blocked: MDBList original rating restoration could not be verified',
+    'MDBList settle verifier is required':
+        'Pilot blocked: MDBList settle verification is unavailable',
+    'MDBList original rating is a half-step':
+        'MDBLIST PILOT BLOCKED — ORIGINAL HALF-STEP RATING',
 }
 
 
@@ -245,7 +253,12 @@ def read_state(name: str, tmdb_id: int, provider: object, client: object,
         authorization = provider.headers.get('Authorization', '')
         if not authorization.startswith('Bearer ') or len(authorization) <= 7:
             raise PilotBlocked('MDBList OAuth access token is unavailable')
-        return State(mdblist_movie_rating(tmdb_id, authorization[7:], client))
+        try:
+            return State(mdblist_movie_rating(
+                tmdb_id, authorization[7:], client, timeout=timeout,
+            ))
+        except Exception as exc:
+            raise PilotBlocked('MDBList rating state could not be verified') from exc
 
     raise PilotBlocked('unknown provider')
 
@@ -270,13 +283,20 @@ def pilot(name: str, payload: dict[str, object], provider: Delivery,
             if str(exc) == 'Simkl movie must already exist exactly once in the library':
                 raise
             raise PilotBlocked('Simkl library state could not be verified') from exc
+        if name == 'mdblist':
+            raise PilotBlocked('MDBList rating state could not be verified') from exc
         raise
     _ensure_safe(name, original, original)
-    if name in {'tmdb', 'trakt', 'simkl'} and verify is None:
+    if (name == 'mdblist' and original.rating is not None
+            and not float(original.rating).is_integer()):
+        raise PilotBlocked('MDBList original rating is a half-step')
+    verified_providers = {'tmdb', 'trakt', 'simkl', 'mdblist'}
+    if name in verified_providers and verify is None:
         message = {
             'tmdb': 'TMDb settle verifier is required',
             'trakt': 'Trakt settle verifier is required',
             'simkl': 'Simkl settle verifier is required',
+            'mdblist': 'MDBList settle verifier is required',
         }[name]
         raise PilotBlocked(message)
     events = ['original state read']
@@ -286,7 +306,7 @@ def pilot(name: str, payload: dict[str, object], provider: Delivery,
         for score in (first, second):
             attempted = True  # A timed-out write may have reached the provider.
             provider.deliver('upsert', {**payload, 'rating': score})
-            if name in {'tmdb', 'trakt', 'simkl'}:
+            if name in verified_providers:
                 current = verify(score, original, False)  # type: ignore[misc]
                 _ensure_safe(name, original, current)
                 if current.rating != score:
@@ -309,7 +329,7 @@ def pilot(name: str, payload: dict[str, object], provider: Delivery,
                         **payload, 'rating': original.rating,
                         'rated_at': original.rated_at,
                     })
-                if name in {'tmdb', 'trakt', 'simkl'}:
+                if name in verified_providers:
                     restored = verify(original.rating, original, True)  # type: ignore[misc]
                     _ensure_safe(name, original, restored)
                     if restored.rating != original.rating:
@@ -332,6 +352,8 @@ def pilot(name: str, payload: dict[str, object], provider: Delivery,
                     if str(exc) == 'Simkl library status changed during the pilot':
                         raise
                     raise PilotBlocked('Simkl original rating restoration could not be verified') from exc
+                if name == 'mdblist':
+                    raise PilotBlocked('MDBList original rating restoration could not be verified') from exc
                 raise PilotBlocked('rollback could not be verified; manual review required') from exc
             except Exception as exc:
                 raise RuntimeError('pilot rollback failed') from exc
@@ -343,6 +365,8 @@ def pilot(name: str, payload: dict[str, object], provider: Delivery,
                 if str(failure) == 'Simkl library status changed during the pilot':
                     raise failure
                 raise PilotBlocked('Simkl library state could not be verified') from failure
+            if name == 'mdblist':
+                raise PilotBlocked('MDBList rating state could not be verified') from failure
             raise PilotBlocked('pilot stopped after failed write or verification') from failure
         raise RuntimeError('pilot failed') from failure
     return events
@@ -376,9 +400,6 @@ def main(argv: list[str] | None = None) -> int:
     if match is None:
         print('Pilot requires one movie:tmdb:<numeric ID> content key')
         return 2
-    if args.provider == 'mdblist':
-        print('Pilot blocked: MDBList writes remain disabled until authorized Phase 4A')
-        return 2
     try:
         if args.env_file:
             _load_env_file(args.env_file)
@@ -389,7 +410,7 @@ def main(argv: list[str] | None = None) -> int:
         payload = {'media_type': 'movie', 'tmdb_id': tmdb_id, 'content_key': args.content}
         with httpx.Client(timeout=10.0, follow_redirects=False) as client:
             verify = None
-            if args.provider in {'tmdb', 'trakt', 'simkl'}:
+            if args.provider in {'tmdb', 'trakt', 'simkl', 'mdblist'}:
                 try:
                     from scripts.settle_verifier import (
                         ROLLBACK_POLICY,
@@ -403,6 +424,7 @@ def main(argv: list[str] | None = None) -> int:
                         'tmdb': 'TMDb settle verifier is required',
                         'trakt': 'Trakt settle verifier is required',
                         'simkl': 'Simkl settle verifier is required',
+                        'mdblist': 'MDBList settle verifier is required',
                     }[args.provider]
                     raise PilotBlocked(message) from exc
                 account_id = (tmdb_account_id(provider, client, 10.0)
@@ -425,7 +447,10 @@ def main(argv: list[str] | None = None) -> int:
                         ) if rollback and args.provider == 'tmdb' else None,
                     )
             events = pilot(args.provider, payload, provider,
-                           lambda: read_state(args.provider, tmdb_id, provider, client),
+                           lambda: read_state(
+                               args.provider, tmdb_id, provider, client,
+                               timeout=10.0 if args.provider == 'mdblist' else None,
+                           ),
                            verify=verify)
         for event in events:
             print(event)

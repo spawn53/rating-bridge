@@ -1,6 +1,7 @@
 """Interactive OAuth/PIN protocol steps. Callers own prompts and persistence."""
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -148,18 +149,39 @@ def poll_simkl_pin(client_id: str, device: DeviceCode, client: httpx.Client,
     raise AuthError("Simkl PIN authorization expired")
 
 
-def mdblist_movie_rating(tmdb_id: int, token: str, client: httpx.Client) -> int | None:
-    """Read every cursor page; fail closed on unknown item shapes or pagination."""
+def mdblist_movie_rating(
+    tmdb_id: int,
+    token: str,
+    client: httpx.Client,
+    timeout: float | None = None,
+    *,
+    monotonic: Callable[[], float] | None = None,
+) -> float | None:
+    """Read every cursor page within one deadline and fail closed on ambiguity."""
+    clock = monotonic or time.monotonic
+    deadline = clock() + timeout if timeout is not None else None
     cursor: str | None = None
     seen: set[str] = set()
-    matches: list[int] = []
+    matches: list[float] = []
     for _ in range(1000):
         params: dict[str, str] = {"limit": "1000"}
         if cursor:
             params["cursor"] = cursor
-        data = _object(client.get("https://api.mdblist.com/sync/ratings",
-                                  params=params, headers={"Authorization": f"Bearer {token}"}),
-                       "MDBList rating read")
+        options: dict[str, float] = {}
+        if deadline is not None:
+            remaining = deadline - clock()
+            if remaining <= 0:
+                raise AuthError("MDBList rating read exceeded its deadline")
+            options["timeout"] = min(10.0, remaining)
+        response = client.get(
+            "https://api.mdblist.com/sync/ratings",
+            params=params,
+            headers={"Authorization": f"Bearer {token}"},
+            **options,
+        )
+        if deadline is not None and clock() > deadline:
+            raise AuthError("MDBList rating read exceeded its deadline")
+        data = _object(response, "MDBList rating read")
         items, page = data.get("movies"), data.get("pagination")
         if not isinstance(items, list) or not isinstance(page, dict) or "next_cursor" not in page:
             raise AuthError("MDBList rating response was incomplete")
@@ -168,14 +190,31 @@ def mdblist_movie_rating(tmdb_id: int, token: str, client: httpx.Client) -> int 
                 raise AuthError("MDBList rating item was incomplete")
             movie = item.get("movie")
             ids = item.get("ids") or (movie.get("ids") if isinstance(movie, dict) else None)
-            if not isinstance(ids, dict):
+            if not isinstance(ids, dict) or not ids:
                 raise AuthError("MDBList rating item IDs were incomplete")
-            if str(ids.get("tmdb")) != str(tmdb_id):
-                continue
-            rating = item.get("rating")
-            if isinstance(rating, bool) or not isinstance(rating, int) or not 1 <= rating <= 10:
+            if "rating_precise" in item:
+                rating = item["rating_precise"]
+            elif "rating" in item:
+                rating = item["rating"]
+            else:
+                raise AuthError("MDBList rating value was missing")
+            if (isinstance(rating, bool) or not isinstance(rating, (int, float))
+                    or not math.isfinite(float(rating))
+                    or not 1 <= float(rating) <= 10
+                    or not (float(rating) * 2).is_integer()):
                 raise AuthError("MDBList rating value was invalid")
-            matches.append(rating)
+            item_tmdb_id = ids.get("tmdb")
+            if item_tmdb_id is None:
+                continue
+            if type(item_tmdb_id) is int and item_tmdb_id > 0:
+                normalized_tmdb_id = item_tmdb_id
+            elif (isinstance(item_tmdb_id, str) and item_tmdb_id.isascii()
+                  and item_tmdb_id.isdigit() and not item_tmdb_id.startswith("0")):
+                normalized_tmdb_id = int(item_tmdb_id)
+            else:
+                raise AuthError("MDBList rating item TMDb ID was invalid")
+            if normalized_tmdb_id == tmdb_id:
+                matches.append(float(rating))
         next_cursor = page["next_cursor"]
         if next_cursor is None:
             if len(matches) > 1:

@@ -149,12 +149,6 @@ def test_simkl_read_requires_library_status() -> None:
     assert state == State(None, library_status='completed')
 
 
-def test_mdblist_pilot_fails_closed(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(['--provider', 'mdblist', '--content', 'movie:tmdb:550',
-                 '--confirm-live-write']) == 2
-    assert 'writes remain disabled' in capsys.readouterr().out
-
-
 def test_cli_does_not_echo_provider_exception_or_env_values(
     tmp_path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -906,3 +900,287 @@ def test_simkl_read_failure_does_not_expose_body_url_or_headers():
     assert header_marker not in message
     assert 'api.simkl.com' not in message
     assert message == 'Pilot blocked or failed; inspect state manually'
+
+
+def mdblist_item(rating=7, tmdb_id=550):
+    return {'ids': {'tmdb': tmdb_id}, 'rating': rating}
+
+
+def mdblist_page(items, next_cursor=None):
+    return {'movies': items, 'pagination': {'next_cursor': next_cursor}}
+
+
+@pytest.mark.parametrize('rating', [x / 2 for x in range(2, 21)])
+def test_mdblist_reader_accepts_every_half_step(rating):
+    def handler(request):
+        return httpx.Response(200, json=mdblist_page([mdblist_item(rating)]))
+
+    provider = SimpleNamespace(headers={'Authorization': 'Bearer test-token'})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        assert read_state('mdblist', 550, provider, client) == State(rating)
+
+
+def test_mdblist_reader_prefers_precise_rating_without_integer_truncation():
+    def handler(request):
+        return httpx.Response(200, json=mdblist_page([{
+            'movie': {'ids': {'tmdb': 550}},
+            'rating': 7,
+            'rating_precise': 7.5,
+        }]))
+
+    provider = SimpleNamespace(headers={'Authorization': 'Bearer test-token'})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        assert read_state('mdblist', 550, provider, client) == State(7.5)
+
+
+@pytest.mark.parametrize('rating', [7.2, 8.75, True, False])
+def test_mdblist_reader_rejects_invalid_precise_rating_even_with_integer_field(rating):
+    def handler(request):
+        item = mdblist_item(7)
+        item['rating_precise'] = rating
+        return httpx.Response(200, json=mdblist_page([item]))
+
+    provider = SimpleNamespace(headers={'Authorization': 'Bearer test-token'})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PilotBlocked, match='could not be verified'):
+            read_state('mdblist', 550, provider, client)
+
+
+@pytest.mark.parametrize('rating', [7.2, 8.75, True, False])
+def test_mdblist_reader_rejects_invalid_decimal_and_boolean(rating):
+    def handler(request):
+        return httpx.Response(200, json=mdblist_page([mdblist_item(rating)]))
+
+    provider = SimpleNamespace(headers={'Authorization': 'Bearer test-token'})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PilotBlocked, match='could not be verified'):
+            read_state('mdblist', 550, provider, client)
+
+
+@pytest.mark.parametrize('item', [
+    None,
+    {},
+    {'ids': {}, 'rating': 7},
+    {'ids': {'tmdb': True}, 'rating': 7},
+    {'ids': {'tmdb': 0}, 'rating': 7},
+    {'ids': {'tmdb': '0550'}, 'rating': 7},
+    {'ids': {'tmdb': 550}},
+    {'ids': {'imdb': 'tt0000001'}},
+])
+def test_mdblist_reader_rejects_malformed_items_and_ids(item):
+    def handler(request):
+        return httpx.Response(200, json=mdblist_page([item]))
+
+    provider = SimpleNamespace(headers={'Authorization': 'Bearer test-token'})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PilotBlocked, match='could not be verified'):
+            read_state('mdblist', 550, provider, client)
+
+
+@pytest.mark.parametrize('body', [
+    {'pagination': {'next_cursor': None}},
+    {'movies': [], 'pagination': None},
+    {'movies': [], 'pagination': {}},
+    {'movies': [], 'pagination': {'next_cursor': 1}},
+    {'movies': [], 'pagination': {'next_cursor': ''}},
+])
+def test_mdblist_reader_rejects_malformed_collection_and_pagination(body):
+    def handler(request):
+        return httpx.Response(200, json=body)
+
+    provider = SimpleNamespace(headers={'Authorization': 'Bearer test-token'})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PilotBlocked, match='could not be verified'):
+            read_state('mdblist', 550, provider, client)
+
+
+def test_mdblist_reader_rejects_duplicate_match_across_pages():
+    def handler(request):
+        cursor = request.url.params.get('cursor')
+        return httpx.Response(
+            200,
+            json=mdblist_page(
+                [mdblist_item(7)],
+                'second-page' if cursor is None else None,
+            ),
+        )
+
+    provider = SimpleNamespace(headers={'Authorization': 'Bearer test-token'})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PilotBlocked, match='could not be verified'):
+            read_state('mdblist', 550, provider, client)
+
+
+def test_mdblist_reader_rejects_cursor_loop():
+    cursors = []
+
+    def handler(request):
+        cursors.append(request.url.params.get('cursor'))
+        return httpx.Response(200, json=mdblist_page([], 'loop'))
+
+    provider = SimpleNamespace(headers={'Authorization': 'Bearer test-token'})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PilotBlocked, match='could not be verified'):
+            read_state('mdblist', 550, provider, client)
+    assert cursors == [None, 'loop']
+
+
+def test_mdblist_reader_stops_when_pagination_exhausts_budget(monkeypatch):
+    from hub import auth_flows
+
+    timer = FakeClock()
+    seen_timeouts = []
+
+    def handler(request):
+        seen_timeouts.append(request.extensions['timeout']['read'])
+        timer.now += 1.1
+        return httpx.Response(200, json=mdblist_page([], 'next'))
+
+    monkeypatch.setattr(auth_flows.time, 'monotonic', timer.clock)
+    provider = SimpleNamespace(headers={'Authorization': 'Bearer test-token'})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PilotBlocked, match='could not be verified'):
+            read_state('mdblist', 550, provider, client, timeout=2)
+    assert len(seen_timeouts) == 2
+    assert seen_timeouts[0] == 2
+    assert 0 < seen_timeouts[1] <= 0.9
+
+
+def test_mdblist_read_failure_suppresses_token_url_and_body():
+    token = 'private-mdblist-token'
+    body = 'private-mdblist-response-body'
+
+    def handler(request):
+        assert token in request.headers['Authorization']
+        return httpx.Response(401, text=body)
+
+    provider = SimpleNamespace(headers={'Authorization': 'Bearer ' + token})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PilotBlocked) as error:
+            read_state('mdblist', 550, provider, client, timeout=3)
+    message = operator_failure(error.value)
+    assert token not in message
+    assert body not in message
+    assert 'api.mdblist.com' not in message
+    assert message == 'Pilot blocked: MDBList rating state could not be verified'
+
+
+def mdblist_settle(values, *, expected=7, rollback=False):
+    timer = FakeClock()
+    reader = Samples([
+        value if isinstance(value, Exception) else State(value)
+        for value in values
+    ])
+    result = wait_for_state(
+        'mdblist', State(None), expected, reader,
+        policy=ROLLBACK_POLICY if rollback else UPSERT_POLICY,
+        rollback=rollback, clock=timer.clock, sleep=timer.sleep,
+    )
+    return result, timer.now, reader.index
+
+
+def test_mdblist_settle_delayed_rating_visibility():
+    result, elapsed, reads = mdblist_settle([None, None, 7, 7, 7])
+    assert result == State(7)
+    assert elapsed == 8
+    assert reads == 5
+
+
+def test_mdblist_settle_upsert_rebound_resets_streak():
+    result, elapsed, reads = mdblist_settle([None, None, 7, None, 7, 7, 7])
+    assert result == State(7)
+    assert elapsed == 12
+    assert reads == 7
+
+
+def test_mdblist_settle_read_error_resets_streak():
+    result, elapsed, reads = mdblist_settle([
+        7, 7, RuntimeError('private-read-error'), 7, 7, 7,
+    ])
+    assert result == State(7)
+    assert elapsed == 10
+    assert reads == 6
+
+
+def test_mdblist_settle_stable_unrated_rollback_observes_full_window():
+    result, elapsed, reads = mdblist_settle(
+        [9, 9] + [None] * 22, expected=None, rollback=True,
+    )
+    assert result == State(None)
+    assert elapsed == 120
+    assert reads == 24
+
+
+def test_mdblist_settle_late_rollback_rebound_fails():
+    values = [None] * 22 + [7, None]
+    with pytest.raises(PilotBlocked, match='timed out'):
+        mdblist_settle(values, expected=None, rollback=True)
+
+
+def test_mdblist_pilot_restores_original_integer_rating_exactly():
+    fake = FakeDelivery(State(6))
+    verified = []
+    events = pilot(
+        'mdblist', {'media_type': 'movie', 'tmdb_id': 550},
+        fake, lambda: fake.state, verify=fake_settle(fake, verified),
+    )
+    assert verified == [(7, False), (9, False), (6, True)]
+    assert fake.calls == [('upsert', 7), ('upsert', 9), ('upsert', 6)]
+    assert events[-1] == 'original rating verified restored'
+
+
+def test_mdblist_half_step_original_blocks_before_any_write():
+    fake = FakeDelivery(State(7.5))
+    with pytest.raises(PilotBlocked, match='half-step') as error:
+        pilot(
+            'mdblist', {'media_type': 'movie', 'tmdb_id': 550},
+            fake, lambda: fake.state, verify=fake_settle(fake),
+        )
+    assert fake.calls == []
+    assert operator_failure(error.value) == (
+        'MDBLIST PILOT BLOCKED — ORIGINAL HALF-STEP RATING'
+    )
+
+
+def test_mdblist_has_no_half_step_integer_truncation_path():
+    fake = FakeDelivery(State(7.5))
+    verifier_calls = []
+    with pytest.raises(PilotBlocked, match='half-step'):
+        pilot(
+            'mdblist', {'media_type': 'movie', 'tmdb_id': 550},
+            fake, lambda: fake.state,
+            verify=fake_settle(fake, verifier_calls),
+        )
+    assert fake.calls == []
+    assert verifier_calls == []
+
+
+def test_mdblist_settle_verifier_is_required_before_any_write():
+    fake = FakeDelivery(State(None))
+    with pytest.raises(PilotBlocked, match='MDBList settle verifier') as error:
+        pilot(
+            'mdblist', {'media_type': 'movie', 'tmdb_id': 550},
+            fake, lambda: fake.state,
+        )
+    assert fake.calls == []
+    assert operator_failure(error.value) == (
+        'Pilot blocked: MDBList settle verification is unavailable'
+    )
+
+
+def test_mdblist_rollback_timeout_uses_fixed_restoration_failure():
+    fake = FakeDelivery(State(None))
+
+    def fail_rollback(expected, original, rollback):
+        if rollback:
+            raise PilotBlocked('provider settle verification timed out')
+        return fake.state
+
+    with pytest.raises(PilotBlocked, match='MDBList original rating restoration') as error:
+        pilot(
+            'mdblist', {'media_type': 'movie', 'tmdb_id': 550},
+            fake, lambda: fake.state, verify=fail_rollback,
+        )
+    assert operator_failure(error.value) == (
+        'Pilot blocked: MDBList original rating restoration could not be verified'
+    )
