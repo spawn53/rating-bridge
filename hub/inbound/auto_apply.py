@@ -97,6 +97,8 @@ def auto_apply(store: InboundStore, targets: Iterable[str], *, generation: int,
                now: datetime | None = None) -> dict:
     result = counters(True)
     try:
+        if store.media_type != "movie":
+            raise InboundError("Show inbound observation is observe-only; automatic application refused")
         targets = tuple(targets)
         if (targets != GLOBAL_TARGETS or type(max_events) is not int or not 1 <= max_events <= 100
                 or type(echo_grace_seconds) is not int or not 0 <= echo_grace_seconds <= 86400

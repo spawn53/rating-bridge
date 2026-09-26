@@ -115,6 +115,8 @@ def apply_removal_event(store: InboundStore, targets: Iterable[str], *, event_id
     can be recovered without another delete or duplicate delivery. Applied events
     return their original audit and never replay against later canonical state.
     """
+    if store.media_type != "movie":
+        raise InboundError("Show inbound observation is observe-only; mutation refused")
     if confirmed is not True:
         raise InboundError("Removal import requires --confirm-live-import")
     if (type(event_id) is not int or event_id < 1

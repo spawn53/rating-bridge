@@ -125,6 +125,8 @@ def apply_event(store: InboundStore, targets: Iterable[str], *, event_id: int,
     the following audit gap is recovered only by exact provenance and a complete
     three-job payload audit, never by score equality alone.
     """
+    if store.media_type != "movie":
+        raise InboundError("Show inbound observation is observe-only; mutation refused")
     if confirmed is not True:
         raise InboundError("Single-event import requires --confirm-live-import")
     if (type(event_id) is not int or event_id < 1

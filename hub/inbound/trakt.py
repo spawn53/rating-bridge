@@ -1,4 +1,4 @@
-"""Manual movie observation and guarded single-event import. No scheduling."""
+"""Movie production observation/import and manual observe-only show snapshots."""
 from __future__ import annotations
 
 import argparse
@@ -11,7 +11,7 @@ from typing import Callable
 
 import httpx
 
-from hub.inbound.models import InboundError, Snapshot, normalize
+from hub.inbound.models import InboundError, Snapshot, normalize, validate_media_type
 from hub.inbound.storage import InboundStore
 
 
@@ -45,7 +45,8 @@ class InboundSettings:
 
 
 def fetch_snapshot(provider: object, client: httpx.Client, timeout: float = 60,
-                   *, clock: Callable[[], float] | None = None) -> Snapshot:
+                   *, clock: Callable[[], float] | None = None, media_type: str = "movie") -> Snapshot:
+    validate_media_type(media_type)
     clock = clock or time.monotonic
     if not math.isfinite(timeout) or timeout <= 0:
         raise InboundError("Trakt snapshot deadline was invalid")
@@ -61,7 +62,7 @@ def fetch_snapshot(provider: object, client: httpx.Client, timeout: float = 60,
             if remaining <= 0:
                 raise InboundError("Trakt snapshot deadline exhausted")
             response = client.get(
-                "https://api.trakt.tv/users/me/ratings/movies",
+                f"https://api.trakt.tv/users/me/ratings/{media_type}s",
                 headers=headers, params={"page": str(page_number), "limit": "250"},
                 timeout=min(10.0, remaining),
             )
@@ -88,7 +89,7 @@ def fetch_snapshot(provider: object, client: httpx.Client, timeout: float = 60,
                 raise InboundError("Trakt snapshot pagination changed during read")
             totals = current_totals
             for item in items:
-                rating = normalize(item)
+                rating = normalize(item, media_type=media_type)
                 (eligible if rating.tmdb_id is not None else unmapped).append(rating)
             observed += len(items)
             if observed > count:
@@ -96,7 +97,7 @@ def fetch_snapshot(provider: object, client: httpx.Client, timeout: float = 60,
             if pages == 0 or page >= pages:
                 if observed != count:
                     raise InboundError("Trakt snapshot item count was inconsistent")
-                snapshot = Snapshot(tuple(eligible), tuple(unmapped))
+                snapshot = Snapshot(tuple(eligible), tuple(unmapped), media_type=media_type)
                 if clock() > deadline:
                     raise InboundError("Trakt snapshot deadline exhausted")
                 return snapshot
@@ -131,6 +132,7 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--apply-event", type=int)
     mode.add_argument("--reclassify-event", type=int)
     mode.add_argument("--apply-removal-event", type=int)
+    parser.add_argument("--media-type", choices=("movie", "show"), default="movie")
     parser.add_argument("--expect-canonical-source")
     parser.add_argument("--expect-event-type", choices=("removed",))
     parser.add_argument("--expect-old-rating", type=int)
@@ -146,6 +148,9 @@ def main(argv: list[str] | None = None) -> int:
     applying = args.apply_event is not None
     reclassifying = args.reclassify_event is not None
     removing = args.apply_removal_event is not None
+    if args.media_type != "movie" and (args.scheduled_observe or applying or removing or reclassifying):
+        print("Trakt show observation is manual and observe-only; application and scheduling refused")
+        return 2
     expectations = (args.expect_content_key, args.expect_rating,
                     args.expect_generation, args.expect_canonical_revision)
     repair_expectations = (args.expect_content_key, args.expect_generation,
@@ -214,7 +219,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("canonical_mutations=0")
                 print("provider_writes=0")
             return 0
-        store = InboundStore(settings.db_path)
+        store = InboundStore(settings.db_path, media_type=args.media_type)
         if removing:
             from hub.inbound.removal import apply_removal_event
             result = apply_removal_event(
@@ -263,14 +268,16 @@ def main(argv: list[str] | None = None) -> int:
             print("direct_provider_writes=0")
             return 0
         with httpx.Client(timeout=10.0, follow_redirects=False) as client:
-            result = observe(store, lambda: fetch_snapshot(get_provider("trakt"), client),
+            result = observe(store, lambda: fetch_snapshot(get_provider("trakt"), client, media_type=args.media_type),
                              baseline=args.baseline, reset=args.reset)
         print("Trakt inbound baseline created" if args.baseline else "Trakt inbound observation complete")
         keys = ("movies", "eligible", "skipped", "snapshot_hash", "events") if args.baseline else (
             "added", "changed", "removed", "deferred"
         )
-        for key in (*keys, "canonical_mutations", "provider_writes"):
-            print(f"{key}={result[key]}")
+        for key in (*keys, "generation", "snapshot_changed", "canonical_mutations", "provider_writes"):
+            value = result[key]
+            label = "shows" if args.media_type == "show" and key == "movies" else key
+            print(f"{label}={str(value).lower() if type(value) is bool else value}")
         return 0
     except InboundError as exc:
         # Only fixed local messages and sanitized counters reach operator output.

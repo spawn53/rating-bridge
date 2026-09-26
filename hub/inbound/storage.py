@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -8,42 +7,19 @@ from pathlib import Path
 import sqlite3
 
 from hub.inbound.classification import classify
-from hub.inbound.models import InboundError, MovieRating, Snapshot
+from hub.inbound.models import InboundError, Snapshot, validate_media_type
+from hub.inbound.schema import EVENT_SCHEMA, migrate_inbound, migrate_events
 
 PROVIDER = "trakt"
 MEDIA = "movie"
-
-EVENT_SCHEMA = """
-CREATE TABLE IF NOT EXISTS inbound_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    fingerprint TEXT NOT NULL UNIQUE,
-    provider TEXT NOT NULL,
-    media_type TEXT NOT NULL CHECK(media_type='movie'),
-    content_key TEXT NOT NULL,
-    generation INTEGER NOT NULL,
-    event_type TEXT NOT NULL CHECK(event_type IN ('added','changed','removed')),
-    old_rating INTEGER,
-    new_rating INTEGER,
-    provider_rated_at TEXT NOT NULL,
-    detected_at TEXT NOT NULL,
-    status TEXT NOT NULL CHECK(status IN ('observed','ignored','applied')),
-    reason TEXT NOT NULL,
-    classification TEXT NOT NULL,
-    future_action TEXT,
-    applied_at TEXT,
-    canonical_revision INTEGER,
-    CHECK((status='applied' AND applied_at IS NOT NULL
-        AND canonical_revision IS NOT NULL AND canonical_revision > 0)
-        OR (status!='applied' AND applied_at IS NULL AND canonical_revision IS NULL))
-);
-"""
 
 
 class InboundStore:
     """Owns only inbound tables. Canonical/outbox access is SELECT-only."""
 
-    def __init__(self, path: str, *, initialize: bool = True):
+    def __init__(self, path: str, *, initialize: bool = True, media_type: str = "movie"):
         self.path = path
+        self.media_type = validate_media_type(media_type)
         self._existing_only = not initialize
         if path == ":memory:":
             raise InboundError("Inbound observation requires a persistent SQLite path")
@@ -63,76 +39,11 @@ class InboundStore:
             return
         Path(path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS inbound_state (
-                    provider TEXT NOT NULL,
-                    media_type TEXT NOT NULL CHECK(media_type='movie'),
-                    baseline_created_at TEXT NOT NULL,
-                    last_successful_poll_at TEXT NOT NULL,
-                    snapshot_hash TEXT NOT NULL,
-                    generation INTEGER NOT NULL,
-                    observed_count INTEGER NOT NULL,
-                    skipped_count INTEGER NOT NULL,
-                    PRIMARY KEY(provider,media_type)
-                );
-                CREATE TABLE IF NOT EXISTS inbound_snapshots (
-                    provider TEXT NOT NULL,
-                    media_type TEXT NOT NULL CHECK(media_type='movie'),
-                    content_key TEXT NOT NULL,
-                    rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 10),
-                    rated_at TEXT NOT NULL,
-                    tmdb_id INTEGER NOT NULL,
-                    trakt_id INTEGER,
-                    imdb_id TEXT,
-                    observed_at TEXT NOT NULL,
-                    PRIMARY KEY(provider,media_type,content_key)
-                );
-                CREATE TABLE IF NOT EXISTS inbound_unmapped (
-                    provider TEXT NOT NULL,
-                    media_type TEXT NOT NULL CHECK(media_type='movie'),
-                    ordinal INTEGER NOT NULL,
-                    rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 10),
-                    rated_at TEXT NOT NULL,
-                    trakt_id INTEGER,
-                    imdb_id TEXT,
-                    observed_at TEXT NOT NULL,
-                    PRIMARY KEY(provider,media_type,ordinal)
-                );
-            """)
-            self._migrate_events(conn)
+            migrate_inbound(conn)
 
     @staticmethod
     def _migrate_events(conn: sqlite3.Connection) -> None:
-        # Serialize schema checks too: concurrent constructors must not rebuild twice.
-        conn.execute("BEGIN IMMEDIATE")
-        existing = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='inbound_events'"
-        ).fetchone()
-        if existing is None:
-            conn.execute(EVENT_SCHEMA)
-            return
-        columns = [r[1] for r in conn.execute("PRAGMA table_info(inbound_events)")]
-        if "'applied'" in existing[0] and {"applied_at", "canonical_revision"} <= set(columns):
-            return
-        expected = {
-            "id", "fingerprint", "provider", "media_type", "content_key", "generation",
-            "event_type", "old_rating", "new_rating", "provider_rated_at", "detected_at",
-            "status", "reason", "classification", "future_action", "applied_at",
-            "canonical_revision",
-        }
-        if set(columns) - expected:
-            raise InboundError("Inbound event schema was not recognized; migration refused")
-        sequence = conn.execute(
-            "SELECT seq FROM sqlite_sequence WHERE name='inbound_events'"
-        ).fetchone()
-        conn.execute(EVENT_SCHEMA.replace("inbound_events", "inbound_events_migration", 1))
-        names = ",".join(columns)  # Restricted to the fixed column whitelist above.
-        conn.execute(f"INSERT INTO inbound_events_migration ({names}) SELECT {names} FROM inbound_events")
-        conn.execute("DROP TABLE inbound_events")
-        conn.execute("ALTER TABLE inbound_events_migration RENAME TO inbound_events")
-        if sequence is not None:
-            conn.execute("UPDATE sqlite_sequence SET seq=MAX(seq,?) WHERE name='inbound_events'",
-                         (sequence[0],))
+        migrate_events(conn)
 
     def connect(self) -> sqlite3.Connection:
         if self._existing_only:
@@ -144,10 +55,11 @@ class InboundStore:
         conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
-    def state(self) -> dict | None:
+    def state(self, media_type: str | None = None) -> dict | None:
+        media_type = self.media_type if media_type is None else validate_media_type(media_type)
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM inbound_state WHERE provider=? AND media_type=?",
-                               (PROVIDER, MEDIA)).fetchone()
+                               (PROVIDER, media_type)).fetchone()
             return dict(row) if row else None
 
     @staticmethod
@@ -167,12 +79,14 @@ class InboundStore:
     def publish(self, snapshot: Snapshot, *, expected_generation: int | None,
                 baseline: bool = False, reset: bool = False) -> dict:
         """Generation CAS and a single transaction prevent partial/crash publication."""
+        if snapshot.media_type != self.media_type:
+            raise InboundError("Inbound snapshot media does not match the store scope")
         counts = {"added": 0, "changed": 0, "removed": 0, "deferred": 0}
         now = datetime.now(timezone.utc).isoformat()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             state = conn.execute(
-                "SELECT * FROM inbound_state WHERE provider=? AND media_type=?", (PROVIDER, MEDIA)
+                "SELECT * FROM inbound_state WHERE provider=? AND media_type=?", (PROVIDER, self.media_type)
             ).fetchone()
             generation = state["generation"] if state else None
             if generation != expected_generation:
@@ -186,14 +100,14 @@ class InboundStore:
                 conn.execute("""
                     UPDATE inbound_state SET last_successful_poll_at=?,observed_count=?,skipped_count=?
                     WHERE provider=? AND media_type=?
-                """, (now, snapshot.movies, len(snapshot.unmapped), PROVIDER, MEDIA))
+                """, (now, snapshot.movies, len(snapshot.unmapped), PROVIDER, self.media_type))
                 return {**counts, "events": 0, "movies": snapshot.movies,
                         "eligible": len(snapshot.eligible), "skipped": len(snapshot.unmapped),
                         "snapshot_hash": snapshot.snapshot_hash, "generation": generation,
                         "snapshot_changed": False, "canonical_mutations": 0, "provider_writes": 0}
             version = (generation or 0) + 1
             previous = {r["content_key"]: dict(r) for r in conn.execute(
-                "SELECT * FROM inbound_snapshots WHERE provider=? AND media_type=?", (PROVIDER, MEDIA)
+                "SELECT * FROM inbound_snapshots WHERE provider=? AND media_type=?", (PROVIDER, self.media_type)
             )}
             current = {r.content_key: r for r in snapshot.eligible}
             if not baseline:
@@ -209,7 +123,7 @@ class InboundStore:
                     decision = classify(key, new_rating, canonical, jobs)
                     counts["deferred"] += decision.kind == "defer"
                     # Include occurrence generation, so A->B->A->B remains auditable.
-                    identity = [PROVIDER, MEDIA, version, key, event_type, old_rating,
+                    identity = [PROVIDER, self.media_type, version, key, event_type, old_rating,
                                 new_rating, snapshot.snapshot_hash]
                     fingerprint = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
                     conn.execute("""
@@ -218,18 +132,18 @@ class InboundStore:
                             old_rating,new_rating,provider_rated_at,detected_at,status,reason,
                             classification,future_action
                         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """, (fingerprint, PROVIDER, MEDIA, key, version, event_type, old_rating,
+                    """, (fingerprint, PROVIDER, self.media_type, key, version, event_type, old_rating,
                           new_rating, new.rated_at if new else old["rated_at"], now,
                           "ignored" if decision.kind in {"echo", "noop"} else "observed",
                           decision.reason, decision.kind, decision.future_action))
-            conn.execute("DELETE FROM inbound_snapshots WHERE provider=? AND media_type=?", (PROVIDER, MEDIA))
+            conn.execute("DELETE FROM inbound_snapshots WHERE provider=? AND media_type=?", (PROVIDER, self.media_type))
             conn.executemany("""
                 INSERT INTO inbound_snapshots VALUES (?,?,?,?,?,?,?,?,?)
-            """, [(PROVIDER, MEDIA, r.content_key, r.rating, r.rated_at,
+            """, [(PROVIDER, self.media_type, r.content_key, r.rating, r.rated_at,
                    r.tmdb_id, r.trakt_id, r.imdb_id, now) for r in snapshot.eligible])
-            conn.execute("DELETE FROM inbound_unmapped WHERE provider=? AND media_type=?", (PROVIDER, MEDIA))
+            conn.execute("DELETE FROM inbound_unmapped WHERE provider=? AND media_type=?", (PROVIDER, self.media_type))
             conn.executemany("INSERT INTO inbound_unmapped VALUES (?,?,?,?,?,?,?,?)",
-                             [(PROVIDER, MEDIA, i, r.rating, r.rated_at,
+                             [(PROVIDER, self.media_type, i, r.rating, r.rated_at,
                                r.trakt_id, r.imdb_id, now) for i, r in enumerate(snapshot.unmapped)])
             conn.execute("""
                 INSERT INTO inbound_state VALUES (?,?,?,?,?,?,?,?)
@@ -238,7 +152,7 @@ class InboundStore:
                     last_successful_poll_at=excluded.last_successful_poll_at,
                     snapshot_hash=excluded.snapshot_hash,generation=excluded.generation,
                     observed_count=excluded.observed_count,skipped_count=excluded.skipped_count
-            """, (PROVIDER, MEDIA, now if baseline else state["baseline_created_at"],
+            """, (PROVIDER, self.media_type, now if baseline else state["baseline_created_at"],
                   now, snapshot.snapshot_hash, version, snapshot.movies, len(snapshot.unmapped)))
         return {**counts, "events": sum(counts[k] for k in ("added", "changed", "removed")),
                 "movies": snapshot.movies, "eligible": len(snapshot.eligible),

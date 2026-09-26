@@ -22,6 +22,8 @@ def reclassify_event(store: InboundStore, *, event_id: int, expected_key: str,
     A previously repaired event safely returns without any UPDATE after the same
     snapshot/canonical/classification checks; other event shapes fail closed.
     """
+    if store.media_type != "movie":
+        raise InboundError("Show inbound observation is observe-only; mutation refused")
     if confirmed is not True:
         raise InboundError("Event reclassification requires --confirm-reclassification")
     if (type(event_id) is not int or event_id < 1

@@ -397,3 +397,40 @@ validate exactly one temporary true-flag cycle, then immediately restore false.
 Restart the same timer and verify one real observe-only activation, unchanged
 generation/snapshot rows/canonical/outbox/events, and no provider rating writes.
 Production must finish with observation enabled and automatic application off.
+
+### Phase 6A: manual Trakt show observation with isolated state
+
+Trakt movie observation, guarded upsert/removal import and scheduled auto-apply
+are production enabled. The existing timer, oneshot and flock remain movie-only:
+`TRAKT_INBOUND_MEDIA_TYPES=movie`, `TRAKT_INBOUND_AUTO_APPLY=true`, max events 10,
+echo grace 600 seconds, and global targets `tmdb,trakt,simkl,mdblist`. Imported
+movie events continue to exclude Trakt from their outbound jobs.
+
+Trakt shows now support complete validated snapshots, a baseline and added,
+changed and removed delta audit. Manual commands use the deployed OAuth lifecycle:
+
+```bash
+python -m hub.inbound.trakt --baseline --media-type show
+python -m hub.inbound.trakt --once --observe-only --media-type show
+```
+
+The default media selection remains movie. Show canonical import, removal import,
+reclassification, auto-apply and scheduled polling are disabled and fail closed.
+Episode/season inbound observation is unsupported. Existing show ratings captured
+by the baseline are historical source state: they create no events, canonical
+ratings or outbox jobs and are never automatically backfilled.
+
+Show identities use `show:tmdb:<id>`; movie identities retain `movie:tmdb:<id>`.
+Snapshots cannot mix media. Each medium has independent state, hash, generation,
+snapshots and unmapped records. An identical poll preserves its generation and
+snapshot/event rows, updating only safe poll metadata. Movie snapshot serialization
+and fingerprint construction remain compatible with their pre-6A values.
+
+Initialization migrates the four inbound tables under `BEGIN IMMEDIATE` from
+recognized movie-only constraints to `media_type IN ('movie','show')`. It preserves
+all logical rows, IDs, fingerprints, audit timestamps and event AUTOINCREMENT
+sequence. Repeated initialization is idempotent; unknown/incomplete DDL or attached
+schema objects are refused without partial migration. Canonical ratings and outbox
+are never changed by migration. Scheduled commands open existing schemas without
+initialization; deployment performs the migration explicitly while the timer is
+stopped and after a mode-0600 SQLite API backup.
