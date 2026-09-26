@@ -46,6 +46,16 @@ _SAFE_PILOT_MESSAGES = {
         'Pilot blocked: Trakt rated_at restoration could not be verified',
     'Trakt settle verifier is required':
         'Pilot blocked: Trakt settle verification is unavailable',
+    'Simkl library state could not be verified':
+        'Pilot blocked: Simkl library state could not be verified',
+    'Simkl movie must already exist exactly once in the library':
+        'Pilot blocked: Simkl movie is not uniquely present in the library',
+    'Simkl library status changed during the pilot':
+        'Pilot blocked: Simkl library status changed during the pilot',
+    'Simkl original rating restoration could not be verified':
+        'Pilot blocked: Simkl original rating restoration could not be verified',
+    'Simkl settle verifier is required':
+        'Pilot blocked: Simkl settle verification is unavailable',
 }
 
 
@@ -180,10 +190,17 @@ def read_state(name: str, tmdb_id: int, provider: object, client: object,
 
     if name == 'simkl':
         from hub.providers.simkl import BASE_URL
+        if timeout is not None and timeout <= 0:
+            raise PilotBlocked('Simkl library state could not be verified')
+        started = time.monotonic()
+        options = {'timeout': min(10.0, timeout)} if timeout is not None else {}
         data = _json(client.get(
             f'{BASE_URL}/sync/all-items/movies',
             params={'client_id': provider.client_id}, headers=provider.headers,
+            **options,
         ))
+        if timeout is not None and time.monotonic() - started > timeout:
+            raise PilotBlocked('Simkl library state could not be verified')
         items = data.get('movies') if isinstance(data, dict) else None
         if not isinstance(items, list):
             raise PilotBlocked('Simkl library response was incomplete')
@@ -193,17 +210,33 @@ def read_state(name: str, tmdb_id: int, provider: object, client: object,
                 raise PilotBlocked('Simkl library item was malformed')
             movie = item.get('movie')
             ids = movie.get('ids') if isinstance(movie, dict) else None
-            if isinstance(ids, dict) and str(ids.get('tmdb')) == str(tmdb_id):
+            if not isinstance(ids, dict) or not ids:
+                raise PilotBlocked('Simkl library item was malformed')
+            if 'tmdb' not in ids:
+                continue
+            item_tmdb_id = ids['tmdb']
+            if type(item_tmdb_id) is int and item_tmdb_id > 0:
+                normalized_tmdb_id = item_tmdb_id
+            elif (isinstance(item_tmdb_id, str) and item_tmdb_id.isascii()
+                  and item_tmdb_id.isdigit() and not item_tmdb_id.startswith('0')):
+                normalized_tmdb_id = int(item_tmdb_id)
+            else:
+                raise PilotBlocked('Simkl library item had an invalid TMDb ID')
+            if normalized_tmdb_id == tmdb_id:
                 matches.append(item)
         if len(matches) != 1:
             raise PilotBlocked('Simkl movie must already exist exactly once in the library')
         status = matches[0].get('status')
-        if not isinstance(status, str) or not status:
+        if not isinstance(status, str) or not status.strip():
             raise PilotBlocked('Simkl library status was missing')
         if 'user_rating' not in matches[0]:
             raise PilotBlocked('Simkl user rating field was missing')
-        score = _rating(matches[0].get('user_rating'))
-        if score is not None and not score.is_integer():
+        raw_rating = matches[0]['user_rating']
+        if raw_rating is None:
+            score = None
+        elif type(raw_rating) is int and 1 <= raw_rating <= 10:
+            score = raw_rating
+        else:
             raise PilotBlocked('Simkl rating was not an integer')
         return State(score, library_status=status)
 
@@ -233,11 +266,18 @@ def pilot(name: str, payload: dict[str, object], provider: Delivery,
     except PilotBlocked as exc:
         if name == 'trakt':
             raise PilotBlocked('Trakt rating state could not be verified') from exc
+        if name == 'simkl':
+            if str(exc) == 'Simkl movie must already exist exactly once in the library':
+                raise
+            raise PilotBlocked('Simkl library state could not be verified') from exc
         raise
     _ensure_safe(name, original, original)
-    if name in {'tmdb', 'trakt'} and verify is None:
-        message = ('TMDb settle verifier is required' if name == 'tmdb'
-                   else 'Trakt settle verifier is required')
+    if name in {'tmdb', 'trakt', 'simkl'} and verify is None:
+        message = {
+            'tmdb': 'TMDb settle verifier is required',
+            'trakt': 'Trakt settle verifier is required',
+            'simkl': 'Simkl settle verifier is required',
+        }[name]
         raise PilotBlocked(message)
     events = ['original state read']
     attempted = False
@@ -246,7 +286,7 @@ def pilot(name: str, payload: dict[str, object], provider: Delivery,
         for score in (first, second):
             attempted = True  # A timed-out write may have reached the provider.
             provider.deliver('upsert', {**payload, 'rating': score})
-            if name in {'tmdb', 'trakt'}:
+            if name in {'tmdb', 'trakt', 'simkl'}:
                 current = verify(score, original, False)  # type: ignore[misc]
                 _ensure_safe(name, original, current)
                 if current.rating != score:
@@ -269,7 +309,7 @@ def pilot(name: str, payload: dict[str, object], provider: Delivery,
                         **payload, 'rating': original.rating,
                         'rated_at': original.rated_at,
                     })
-                if name in {'tmdb', 'trakt'}:
+                if name in {'tmdb', 'trakt', 'simkl'}:
                     restored = verify(original.rating, original, True)  # type: ignore[misc]
                     _ensure_safe(name, original, restored)
                     if restored.rating != original.rating:
@@ -288,6 +328,10 @@ def pilot(name: str, payload: dict[str, object], provider: Delivery,
                     if str(exc) == 'Trakt rated_at restoration could not be verified':
                         raise
                     raise PilotBlocked('Trakt original rating restoration could not be verified') from exc
+                if name == 'simkl':
+                    if str(exc) == 'Simkl library status changed during the pilot':
+                        raise
+                    raise PilotBlocked('Simkl original rating restoration could not be verified') from exc
                 raise PilotBlocked('rollback could not be verified; manual review required') from exc
             except Exception as exc:
                 raise RuntimeError('pilot rollback failed') from exc
@@ -295,6 +339,10 @@ def pilot(name: str, payload: dict[str, object], provider: Delivery,
         if type(failure) is PilotBlocked:
             if name == 'trakt':
                 raise PilotBlocked('Trakt rating state could not be verified') from failure
+            if name == 'simkl':
+                if str(failure) == 'Simkl library status changed during the pilot':
+                    raise failure
+                raise PilotBlocked('Simkl library state could not be verified') from failure
             raise PilotBlocked('pilot stopped after failed write or verification') from failure
         raise RuntimeError('pilot failed') from failure
     return events
@@ -341,7 +389,7 @@ def main(argv: list[str] | None = None) -> int:
         payload = {'media_type': 'movie', 'tmdb_id': tmdb_id, 'content_key': args.content}
         with httpx.Client(timeout=10.0, follow_redirects=False) as client:
             verify = None
-            if args.provider in {'tmdb', 'trakt'}:
+            if args.provider in {'tmdb', 'trakt', 'simkl'}:
                 try:
                     from scripts.settle_verifier import (
                         ROLLBACK_POLICY,
@@ -351,9 +399,11 @@ def main(argv: list[str] | None = None) -> int:
                         wait_for_state,
                     )
                 except Exception as exc:
-                    message = ('TMDb settle verifier is required'
-                               if args.provider == 'tmdb'
-                               else 'Trakt settle verifier is required')
+                    message = {
+                        'tmdb': 'TMDb settle verifier is required',
+                        'trakt': 'Trakt settle verifier is required',
+                        'simkl': 'Simkl settle verifier is required',
+                    }[args.provider]
                     raise PilotBlocked(message) from exc
                 account_id = (tmdb_account_id(provider, client, 10.0)
                               if args.provider == 'tmdb' else None)

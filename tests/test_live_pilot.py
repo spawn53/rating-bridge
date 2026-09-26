@@ -184,6 +184,15 @@ def test_operator_failure_exposes_only_allowlisted_pilot_reasons() -> None:
     assert operator_failure(PilotBlocked('Trakt settle verifier is required')) == (
         'Pilot blocked: Trakt settle verification is unavailable'
     )
+    assert operator_failure(PilotBlocked('Simkl library state could not be verified')) == (
+        'Pilot blocked: Simkl library state could not be verified'
+    )
+    assert operator_failure(PilotBlocked('Simkl settle verifier is required')) == (
+        'Pilot blocked: Simkl settle verification is unavailable'
+    )
+    assert operator_failure(PilotBlocked(
+        'Simkl movie must already exist exactly once in the library'
+    )) == 'Pilot blocked: Simkl movie is not uniquely present in the library'
     marker = 'https://example.invalid/?session_id=sensitive-marker-123'
     for error in (PilotBlocked(marker), RuntimeError(marker)):
         message = operator_failure(error)
@@ -667,4 +676,233 @@ def test_trakt_read_failure_does_not_expose_body_or_url():
     assert body_marker not in message
     assert url_marker not in message
     assert 'api.trakt.tv' not in message
+    assert message == 'Pilot blocked or failed; inspect state manually'
+
+
+def simkl_state(rating=None, status='completed'):
+    return State(rating, library_status=status)
+
+
+def simkl_settle(values, *, original=None, expected=7, rollback=False, timeout=5):
+    timer = FakeClock()
+    original = original or simkl_state()
+    required = 5 if rollback else 3
+    stable_seconds = 4 if rollback else 2
+    reader = Samples(values)
+    result = wait_for_state(
+        'simkl', original, expected, reader,
+        policy=SettlePolicy(timeout, 1, required, stable_seconds, full_window=rollback),
+        rollback=rollback, clock=timer.clock, sleep=timer.sleep,
+    )
+    return result, timer.now, reader.index
+
+
+def simkl_library_item(*, rating=None, status='completed', tmdb_id=265189):
+    return {
+        'status': status,
+        'user_rating': rating,
+        'movie': {'ids': {'tmdb': tmdb_id}},
+    }
+
+
+def test_simkl_settle_verifier_is_required_before_any_write():
+    fake = FakeDelivery(simkl_state())
+    with pytest.raises(PilotBlocked, match='Simkl settle verifier') as error:
+        pilot('simkl', {'media_type': 'movie', 'tmdb_id': 265189},
+              fake, lambda: fake.state)
+    assert fake.calls == []
+    assert operator_failure(error.value) == (
+        'Pilot blocked: Simkl settle verification is unavailable'
+    )
+
+
+def test_simkl_pilot_verifies_both_upserts_and_rollback():
+    fake = FakeDelivery(simkl_state())
+    verified = []
+    events = pilot('simkl', {'media_type': 'movie', 'tmdb_id': 265189},
+                   fake, lambda: fake.state, verify=fake_settle(fake, verified))
+    assert verified == [(7, False), (9, False), (None, True)]
+    assert events[-1] == 'original rating verified restored'
+
+
+def test_simkl_pilot_restores_existing_integer_rating():
+    fake = FakeDelivery(simkl_state(6))
+    verified = []
+    pilot('simkl', {'media_type': 'movie', 'tmdb_id': 265189},
+          fake, lambda: fake.state, verify=fake_settle(fake, verified))
+    assert verified == [(7, False), (9, False), (6, True)]
+    assert fake.calls[-1] == ('upsert', 6)
+    assert fake.state == simkl_state(6)
+
+
+def test_simkl_rollback_timeout_uses_fixed_restoration_failure():
+    fake = FakeDelivery(simkl_state())
+
+    def fail_rollback(expected, original, rollback):
+        if rollback:
+            raise PilotBlocked('provider settle verification timed out')
+        return fake.state
+
+    with pytest.raises(PilotBlocked, match='Simkl original rating restoration') as error:
+        pilot('simkl', {'media_type': 'movie', 'tmdb_id': 265189},
+              fake, lambda: fake.state, verify=fail_rollback)
+    assert operator_failure(error.value) == (
+        'Pilot blocked: Simkl original rating restoration could not be verified'
+    )
+
+
+def test_simkl_settle_delayed_rating_visibility():
+    states = [simkl_state(value) for value in (None, None, 7, 7, 7)]
+    result, elapsed, calls = simkl_settle(states)
+    assert result == simkl_state(7)
+    assert elapsed == 4 and calls == 5
+
+
+def test_simkl_settle_upsert_rebound_does_not_pass_early():
+    states = [simkl_state(value) for value in (None, 7, 7, None, 7)]
+    with pytest.raises(PilotBlocked, match='timed out'):
+        simkl_settle(states)
+
+
+def test_simkl_settle_stable_unrated_rollback_uses_full_window():
+    states = [simkl_state(value) for value in (9, 9, None, None, None, None, None)]
+    result, elapsed, calls = simkl_settle(
+        states, expected=None, rollback=True, timeout=7,
+    )
+    assert result == simkl_state()
+    assert elapsed == 7 and calls == 7
+
+
+def test_simkl_settle_late_rating_rebound_fails_rollback():
+    states = [simkl_state(value) for value in (None, None, None, 7)]
+    with pytest.raises(PilotBlocked, match='timed out'):
+        simkl_settle(states, expected=None, rollback=True, timeout=7)
+
+
+def test_simkl_library_status_mutation_aborts_immediately():
+    timer = FakeClock()
+    reader = Samples([simkl_state(7, 'watching'), simkl_state(7)])
+    with pytest.raises(PilotBlocked, match='library status changed') as error:
+        wait_for_state(
+            'simkl', simkl_state(), 7, reader,
+            policy=SettlePolicy(5, 1, 3, 2),
+            clock=timer.clock, sleep=timer.sleep,
+        )
+    assert timer.now == 0
+    assert reader.index == 1
+    assert operator_failure(error.value) == (
+        'Pilot blocked: Simkl library status changed during the pilot'
+    )
+
+
+def test_simkl_movie_disappearance_cannot_verify_unrated_rollback():
+    timer = FakeClock()
+    reads = 0
+
+    def missing(remaining):
+        nonlocal reads
+        reads += 1
+        raise PilotBlocked('Simkl movie must already exist exactly once in the library')
+
+    with pytest.raises(PilotBlocked, match='timed out'):
+        wait_for_state(
+            'simkl', simkl_state(), None, missing,
+            policy=SettlePolicy(3, 1, 2, 1, full_window=True),
+            rollback=True, clock=timer.clock, sleep=timer.sleep,
+        )
+    assert reads == 3
+
+
+def test_simkl_reader_rejects_duplicate_target():
+    def handler(request):
+        item = simkl_library_item()
+        return httpx.Response(200, json={'movies': [item, item]})
+
+    provider = SimpleNamespace(client_id='test-id', headers={})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PilotBlocked, match='exactly once'):
+            read_state('simkl', 265189, provider, client)
+
+
+def test_simkl_reader_rejects_missing_rating_and_invalid_ratings():
+    invalid_items = [
+        {'status': 'completed', 'movie': {'ids': {'tmdb': 265189}}},
+        simkl_library_item(rating=7.5),
+        simkl_library_item(rating='7'),
+        simkl_library_item(rating=0),
+        simkl_library_item(rating=11),
+    ]
+    provider = SimpleNamespace(client_id='test-id', headers={})
+    for item in invalid_items:
+        def handler(request):
+            return httpx.Response(200, json={'movies': [item]})
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(PilotBlocked):
+                read_state('simkl', 265189, provider, client)
+
+
+def test_simkl_reader_rejects_malformed_items_and_ids():
+    invalid_items = [
+        None,
+        {'status': 'completed', 'user_rating': None},
+        simkl_library_item(tmdb_id=None),
+        simkl_library_item(tmdb_id=True),
+        simkl_library_item(tmdb_id=0),
+        simkl_library_item(tmdb_id='0265189'),
+        simkl_library_item(tmdb_id='not-a-number'),
+    ]
+    provider = SimpleNamespace(client_id='test-id', headers={})
+    for item in invalid_items:
+        def handler(request):
+            return httpx.Response(200, json={'movies': [item]})
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(PilotBlocked):
+                read_state('simkl', 265189, provider, client)
+
+
+def test_simkl_reader_passes_remaining_budget_to_httpx():
+    seen = []
+
+    def handler(request):
+        seen.append(request.extensions['timeout'])
+        return httpx.Response(200, json={'movies': [simkl_library_item()]})
+
+    provider = SimpleNamespace(client_id='test-id', headers={})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        state = read_state('simkl', 265189, provider, client, timeout=3.5)
+    assert state == simkl_state()
+    assert all(value == 3.5 for value in seen[0].values())
+
+
+def test_simkl_reader_rejects_response_finishing_after_budget(monkeypatch):
+    readings = iter((10.0, 14.0))
+    monkeypatch.setattr('scripts.live_pilot.time.monotonic', lambda: next(readings))
+
+    def handler(request):
+        return httpx.Response(200, json={'movies': [simkl_library_item()]})
+
+    provider = SimpleNamespace(client_id='test-id', headers={})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PilotBlocked, match='could not be verified'):
+            read_state('simkl', 265189, provider, client, timeout=3)
+
+
+def test_simkl_read_failure_does_not_expose_body_url_or_headers():
+    body_marker = 'private-simkl-response-body'
+    header_marker = 'private-bearer-token'
+
+    def handler(request):
+        return httpx.Response(401, text=body_marker)
+
+    provider = SimpleNamespace(
+        client_id='private-client-id',
+        headers={'Authorization': 'Bearer ' + header_marker},
+    )
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(httpx.HTTPStatusError) as error:
+            read_state('simkl', 265189, provider, client, timeout=3)
+    message = operator_failure(error.value)
+    assert body_marker not in message
+    assert header_marker not in message
+    assert 'api.simkl.com' not in message
     assert message == 'Pilot blocked or failed; inspect state manually'

@@ -1,6 +1,7 @@
-# TMDb and Trakt settle verification
+# TMDb, Trakt, and Simkl settle verification
 
-Status: TMDb and Trakt verification are integrated into the explicitly gated `scripts/live_pilot.py` command. The
+Status: TMDb, Trakt, and Simkl verification are integrated into the explicitly gated
+`scripts/live_pilot.py` command. The
 API and worker never invoke the pilot. Deployment of this code does not authorize
 a provider write; every live pilot still requires `--confirm-live-write` and a
 separate explicit operational authorization.
@@ -52,8 +53,8 @@ an early matching streak cannot produce early success. At window end the latest
 streak must still meet both requirements. The last observation can precede the
 end by up to one polling interval. Errors or a rebound reset the streak.
 
-These are conservative, configurable operational budgets, not measured TMDb or
-Trakt propagation constants or published service guarantees. The two-minute rollback
+These are conservative, configurable operational budgets, not measured TMDb,
+Trakt, or Simkl propagation constants or published service guarantees. The two-minute rollback
 budget follows the bounded investigation horizon; slower polling keeps request
 volume bounded while covering a longer period than upsert verification. The
 matching durations follow directly from the sample counts and intervals. Review
@@ -77,9 +78,18 @@ window. An originally unrated movie must remain absent, while an existing rating
 must match both its score and original timestamp throughout the required final
 streak.
 
+For Simkl, `/sync/all-items/movies` must contain exactly one target movie with a
+valid status, explicit `user_rating`, and a positive TMDb ID represented as an
+integer or canonical decimal string. A missing or duplicate target, malformed
+item, half-step rating, or ambiguous response fails closed. Every matching
+sample must preserve the original library status; a changed status aborts
+immediately rather than resetting the rating streak. Removal means the movie
+remains present exactly once with `user_rating=None`. Existing ratings restore
+the integer score; Simkl has no timestamp field in this contract.
+
 Readers must enforce the supplied remaining deadline on their I/O. The TMDb
-secondary reader clamps each request timeout to the remaining budget and rejects
-late responses. HTTPX request timeouts apply per I/O phase; they are not a hard
+secondary reader and the Simkl library reader clamp each request timeout to the
+remaining budget and reject late responses. HTTPX request timeouts apply per I/O phase; they are not a hard
 wall-clock cancellation mechanism. Deadline checks prevent accepting late
 results, but blocking I/O can overrun the observation budget. A hard elapsed-time limit would require cancellation-capable orchestration
 before a corrective operation.
@@ -90,8 +100,8 @@ and any subsequent contradiction must invalidate restoration success.
 
 ## Cache and identity review
 
-The current `read_state()` calls a plain HTTPX client directly against TMDb's
-HTTPS API. There is no Rating Hub response cache or reverse-proxy route in this
+The current `read_state()` calls a plain HTTPX client directly against each
+provider HTTPS API. There is no Rating Hub response cache or reverse-proxy route in this
 path. HTTPX connection pooling is not an application response cache. The pilot
 uses one provider object/session for its reads and writes. External observations
 use one provider object/session for both surfaces. Identity continuity across
