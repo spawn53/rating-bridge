@@ -256,10 +256,17 @@ class RatingStore:
             "updated_at": updated_at,
         }
 
-    def delete_rating(self, content_key: str, targets: Iterable[str]) -> dict[str, Any]:
+    def delete_rating(
+        self, content_key: str, targets: Iterable[str], *, source: str | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
+        """Delete atomically, optionally inside a caller-owned write transaction."""
         now = _now()
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with (self._connect() if connection is None else nullcontext(connection)) as conn:
+            if connection is None:
+                conn.execute("BEGIN IMMEDIATE")
+            elif not conn.in_transaction:
+                raise RuntimeError("Canonical delete requires an active transaction")
             row = conn.execute(
                 "SELECT * FROM ratings WHERE content_key = ?",
                 (content_key,),
@@ -273,20 +280,18 @@ class RatingStore:
                 }
 
             revision = int(row["revision"]) + 1
-            payload = dict(row)
-            payload["rating"] = None
-            payload["revision"] = revision
-            payload["deleted"] = 1
-            payload["content_key"] = content_key
-
             conn.execute(
                 """
                 UPDATE ratings
-                SET rating = NULL, deleted = 1, updated_at = ?, revision = ?
+                SET rating = NULL, deleted = 1, updated_at = ?, revision = ?,
+                    source = COALESCE(?, source)
                 WHERE content_key = ?
                 """,
-                (now, revision, content_key),
+                (now, revision, source, content_key),
             )
+            payload = dict(conn.execute(
+                "SELECT * FROM ratings WHERE content_key = ?", (content_key,)
+            ).fetchone())
             self._supersede_pending(conn, content_key, revision, now)
             queued = self._queue(
                 conn,

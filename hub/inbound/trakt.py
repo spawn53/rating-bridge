@@ -119,6 +119,8 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--once", action="store_true")
     mode.add_argument("--apply-event", type=int)
     mode.add_argument("--reclassify-event", type=int)
+    mode.add_argument("--apply-removal-event", type=int)
+    parser.add_argument("--expect-canonical-source")
     parser.add_argument("--expect-event-type", choices=("removed",))
     parser.add_argument("--expect-old-rating", type=int)
     parser.add_argument("--confirm-reclassification", action="store_true")
@@ -132,25 +134,34 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     applying = args.apply_event is not None
     reclassifying = args.reclassify_event is not None
+    removing = args.apply_removal_event is not None
     expectations = (args.expect_content_key, args.expect_rating,
                     args.expect_generation, args.expect_canonical_revision)
     repair_expectations = (args.expect_content_key, args.expect_generation,
                            args.expect_event_type, args.expect_old_rating,
                            args.expect_canonical_revision)
     repair_only = (args.expect_event_type, args.expect_old_rating)
-    if applying:
+    if removing:
+        required = (args.expect_content_key, args.expect_generation, args.expect_old_rating,
+                    args.expect_canonical_revision, args.expect_canonical_source)
+        if (not args.confirm_live_import or any(x is None for x in required)
+                or args.expect_rating is not None or args.expect_event_type is not None
+                or args.confirm_reclassification or args.observe_only or args.reset):
+            print("Trakt removal refused: require confirmation and explicit key/generation/old-rating/revision/source expectations")
+            return 2
+    elif applying:
         if (not args.confirm_live_import or any(x is None for x in expectations)
                 or args.observe_only or args.reset or args.confirm_reclassification
-                or any(x is not None for x in repair_only)):
+                or any(x is not None for x in repair_only) or args.expect_canonical_source is not None):
             print("Trakt import refused: require confirmation and explicit key/rating/generation/revision expectations")
             return 2
     elif reclassifying:
         if (not args.confirm_reclassification or any(x is None for x in repair_expectations)
                 or args.expect_rating is not None or args.confirm_live_import
-                or args.observe_only or args.reset):
+                or args.observe_only or args.reset or args.expect_canonical_source is not None):
             print("Trakt reclassification refused: require confirmation and explicit key/generation/type/old-rating/revision expectations")
             return 2
-    elif (any(x is not None for x in expectations + repair_only)
+    elif (any(x is not None for x in expectations + repair_only) or args.expect_canonical_source is not None
           or args.confirm_live_import or args.confirm_reclassification
           or args.once and (not args.observe_only or args.reset)
           or args.baseline and args.observe_only or args.reset and not args.baseline):
@@ -163,6 +174,19 @@ def main(argv: list[str] | None = None) -> int:
         from hub.settings import HubSettings
         settings = HubSettings.from_env()
         store = InboundStore(settings.db_path)
+        if removing:
+            from hub.inbound.removal import apply_removal_event
+            result = apply_removal_event(
+                store, settings.targets, event_id=args.apply_removal_event,
+                expected_key=args.expect_content_key, expected_generation=args.expect_generation,
+                expected_old_rating=args.expect_old_rating, expected_revision=args.expect_canonical_revision,
+                expected_source=args.expect_canonical_source, confirmed=args.confirm_live_import,
+            )
+            print("Trakt inbound single-event removal import complete")
+            for key in ("event_id", "content_key", "revision", "removed", "queued_targets",
+                        "skipped_targets", "already_applied", "direct_provider_writes"):
+                print(f"{key}={result[key]}")
+            return 0
         if reclassifying:
             from hub.inbound.reclassification import reclassify_event
             result = reclassify_event(
@@ -212,7 +236,9 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc))
         return 1
     except Exception:
-        if reclassifying:
+        if removing:
+            print("Trakt removal command failed; inspect canonical/event audit before retrying")
+        elif reclassifying:
             print("Trakt event reclassification failed; no automatic retry")
         else:
             print("Trakt inbound command failed; inspect canonical/event audit before retrying" if applying

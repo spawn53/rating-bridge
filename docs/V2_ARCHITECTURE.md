@@ -178,14 +178,14 @@ python -m hub.inbound.trakt --apply-event 1 \
 
 The generation and canonical revision are required operator expectations. All
 expectations and the explicit confirmation must be supplied; they cannot be
-mixed with baseline/reset/observer flags. Removed events are unsupported.
+mixed with baseline/reset/observer flags. This upsert mode refuses removed events; Phase 5H provides a separate removal mode.
 The importer performs no HTTP/provider calls. Normal outbox workers deliver
 exactly `tmdb,simkl,mdblist`; global targets still include Trakt.
 
 Under `BEGIN IMMEDIATE`, the importer revalidates the exact persisted event,
 current generation, matching score/timestamp/movie identity in the trusted
 snapshot, absence of superseding events, canonical revision/state, and current
-Trakt outbound classification. Pending/processing/failed Trakt jobs refuse
+Trakt outbound classification. Current-revision pending/processing/failed Trakt jobs refuse
 import. An added event requires absent or tombstoned canonical state; a changed
 event requires the active canonical score to equal the event's old score.
 No candidate classification alone can bypass these checks.
@@ -229,5 +229,58 @@ Repeat repair safely reports already reclassified after the same checks.
 
 Reclassification has no HTTP, canonical, or outbox write path. It does not run
 the observer, advance generation, reset a baseline, or import a removal. The
-existing importer still refuses removed events; delete import remains a
-separately authorized phase. Automatic inbound remains disabled.
+upsert importer still refuses removed events; the separately guarded removal
+operation is described below. Automatic inbound remains disabled.
+
+### Phase 5H: explicitly import one observed Trakt movie removal
+
+```bash
+python -m hub.inbound.trakt --apply-removal-event 3 \
+  --expect-content-key movie:tmdb:265189 --expect-generation 6 \
+  --expect-old-rating 9 --expect-canonical-revision 7 \
+  --expect-canonical-source trakt-inbound:2 --confirm-live-import
+```
+
+This dedicated operation requires every expectation and explicit confirmation;
+upsert, reclassification and observer modes cannot be combined with it. It
+performs no HTTP or direct provider writes. Automatic inbound remains disabled,
+and there is no bulk removal, automatic application, or scheduler.
+
+Under one `BEGIN IMMEDIATE`, the importer verifies the persisted removal's
+identity, fingerprint format, timestamps, candidate/delete classification,
+unapplied audit, current trusted generation, snapshot absence, and absence of
+any newer event. The active canonical movie must match the expected old score,
+revision, source, TMDb identity and retained source rating timestamp. The fixed
+revision-scoped classifier must return exactly
+`candidate/different_provider_state/delete` before deletion. Reappearance in the
+trusted snapshot, changed canonical state, or unsafe Trakt audit refuses import.
+
+`RatingStore.delete_rating()` now accepts optional `source` and `connection`.
+An external connection must already have a transaction; the method never
+commits it. Without a connection, deletion retains its owned transaction.
+Without a source, ordinary API deletion retains existing provenance. Both paths
+queue payloads from the final canonical tombstone, including its new update
+time. Canonical and outbox insertion failures roll back together.
+
+For event 3, canonical revision 7 becomes revision 8 with `rating=NULL`,
+`deleted=1` and `source=trakt-inbound:3`. Identity metadata and `rated_at` remain
+unchanged because the snapshot contract supplies no deletion timestamp. Source
+exclusion derives exactly `tmdb,simkl,mdblist` from unchanged global targets
+`tmdb,trakt,simkl,mdblist`; exactly three remove jobs are committed with the
+tombstone and no Trakt job is generated.
+
+Event marking follows the canonical/outbox commit. Crash-gap replay requires
+that same event and trusted absence, exact tombstone revision/provenance/movie
+identity/retained timestamp, and exactly three remove jobs whose payloads equal
+the complete tombstone. Corrupted audit or an extra Trakt job refuses recovery.
+Successful recovery completes event audit without another delete or duplicate
+job. Already-applied replay returns its original revision and empty queued
+targets without changing later canonical state.
+
+Live removal validation waits for the three jobs to finish and observes each
+target for the full 120-second removal window, polling every five seconds,
+requiring at least five final consecutive matches spanning at least 20 seconds.
+TMDb authenticated rating surfaces must agree and watchlist remain false;
+Simkl must remain uniquely present with its completed library status; MDBList
+must be absent from ratings. A final read checks Trakt remains unrated. A failed
+downstream delivery leaves the tombstone intact for outbox convergence.
