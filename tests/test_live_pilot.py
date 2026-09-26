@@ -980,7 +980,6 @@ def test_mdblist_reader_rejects_malformed_items_and_ids(item):
 @pytest.mark.parametrize('body', [
     {'pagination': {'next_cursor': None}},
     {'movies': [], 'pagination': None},
-    {'movies': [], 'pagination': {}},
     {'movies': [], 'pagination': {'next_cursor': 1}},
     {'movies': [], 'pagination': {'next_cursor': ''}},
 ])
@@ -1184,3 +1183,65 @@ def test_mdblist_rollback_timeout_uses_fixed_restoration_failure():
     assert operator_failure(error.value) == (
         'Pilot blocked: MDBList original rating restoration could not be verified'
     )
+
+@pytest.mark.parametrize('pagination', [{}, {'next_cursor': None}, {'has_more': False}])
+def test_mdblist_terminal_short_page_accepts_absent_target(pagination):
+    def handler(request):
+        assert request.url.params['limit'] == '1000'
+        return httpx.Response(200, json={'movies': [mdblist_item(8, 1)],
+                                        'pagination': pagination})
+    provider = SimpleNamespace(headers={'Authorization': 'Bearer test-token'})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        assert read_state('mdblist', 550, provider, client) == State(None)
+
+
+@pytest.mark.parametrize('pagination', [{}, {'has_more': False}])
+def test_mdblist_full_page_without_cursor_is_ambiguous(pagination):
+    def handler(request):
+        return httpx.Response(200, json={'movies': [mdblist_item(8, 1)] * 1000,
+                                        'pagination': pagination})
+    provider = SimpleNamespace(headers={'Authorization': 'Bearer test-token'})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PilotBlocked):
+            read_state('mdblist', 550, provider, client)
+
+
+@pytest.mark.parametrize('cursor', ['', 0, False, [], {}])
+def test_mdblist_explicit_invalid_cursor_never_uses_short_page_fallback(cursor):
+    def handler(request):
+        return httpx.Response(200, json=mdblist_page([], cursor))
+    provider = SimpleNamespace(headers={'Authorization': 'Bearer test-token'})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PilotBlocked):
+            read_state('mdblist', 550, provider, client)
+
+
+@pytest.mark.parametrize('flag', [True, None, 0, '', []])
+def test_mdblist_missing_cursor_rejects_nonterminal_or_invalid_has_more(flag):
+    def handler(request):
+        return httpx.Response(200, json={'movies': [], 'pagination': {'has_more': flag}})
+    provider = SimpleNamespace(headers={'Authorization': 'Bearer test-token'})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PilotBlocked):
+            read_state('mdblist', 550, provider, client)
+
+
+@pytest.mark.parametrize('duplicate', [False, True])
+def test_mdblist_traverses_to_omitted_terminal_cursor_and_checks_duplicates(duplicate):
+    cursors = []
+    def handler(request):
+        cursor = request.url.params.get('cursor')
+        cursors.append(cursor)
+        if cursor is None:
+            return httpx.Response(200, json=mdblist_page(
+                [mdblist_item(7, 550 if duplicate else 1)], 'page-2'))
+        return httpx.Response(200, json={
+            'movies': [mdblist_item(9)], 'pagination': {}})
+    provider = SimpleNamespace(headers={'Authorization': 'Bearer test-token'})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        if duplicate:
+            with pytest.raises(PilotBlocked):
+                read_state('mdblist', 550, provider, client)
+        else:
+            assert read_state('mdblist', 550, provider, client) == State(9)
+    assert cursors == [None, 'page-2']

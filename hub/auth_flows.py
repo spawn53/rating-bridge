@@ -183,7 +183,7 @@ def mdblist_movie_rating(
             raise AuthError("MDBList rating read exceeded its deadline")
         data = _object(response, "MDBList rating read")
         items, page = data.get("movies"), data.get("pagination")
-        if not isinstance(items, list) or not isinstance(page, dict) or "next_cursor" not in page:
+        if not isinstance(items, list) or not isinstance(page, dict):
             raise AuthError("MDBList rating response was incomplete")
         for item in items:
             if not isinstance(item, dict):
@@ -215,7 +215,16 @@ def mdblist_movie_rating(
                 raise AuthError("MDBList rating item TMDb ID was invalid")
             if normalized_tmdb_id == tmdb_id:
                 matches.append(float(rating))
-        next_cursor = page["next_cursor"]
+        if "next_cursor" not in page:
+            # A full movie page is ambiguous even if a terminal flag is supplied.
+            # Prefer the observed explicit flag over inference when it exists:
+            # has_more=True can describe additional rows of another media type.
+            if (len(items) >= 1000
+                    or ("has_more" in page and page["has_more"] is not False)):
+                raise AuthError("MDBList rating pagination was ambiguous")
+            next_cursor = None
+        else:
+            next_cursor = page["next_cursor"]
         if next_cursor is None:
             if len(matches) > 1:
                 raise AuthError("MDBList returned duplicate movie ratings")

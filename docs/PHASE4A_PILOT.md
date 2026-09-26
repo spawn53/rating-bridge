@@ -16,3 +16,12 @@ The production capability matrix remains unchanged: MDBList and Simkl support mo
 The current adapters require at least one of IMDb/TMDb/Trakt/MDBList IDs for MDBList, one of IMDb/TMDb/Trakt for Trakt, and IMDb or TMDb for Simkl. TMDb requires its own movie or show ID; episodes require the TMDb series ID plus season and episode coordinates. MDBList and Simkl episode writes remain disabled. Those are code-level requirements, not a claim that the live endpoint contracts have been verified.
 
 The tool sanitizes operator output. A failed verification stops further test ratings and attempts rollback. If rollback cannot be verified, it reports manual review is required. It does not promise recovery from a provider outage. IMDb and Letterboxd remain outside this phase.
+
+
+MDBList terminal pagination accepts an explicit null cursor. When the cursor key
+is omitted, fewer than 1000 movie rows are required; a full page remains
+ambiguous. If the observed `has_more` flag is present it must be exactly false,
+so a short movie collection cannot hide continuation for other media types.
+An empty pagination object uses the authorized short-page fallback. Explicit
+invalid cursor values never use that fallback. All pages are still validated
+before absence or a unique target match is accepted.
