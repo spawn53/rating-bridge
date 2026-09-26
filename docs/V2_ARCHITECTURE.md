@@ -104,3 +104,54 @@ the episode UI or post-play flow. Nuvio sends one request only: to Rating Hub.
 - Rating Hub is bound to localhost by default in Compose and should be exposed
   only through the existing authenticated/reverse-proxy setup.
 - IMDb cookies, if used, are treated as password-equivalent secrets.
+
+## Phase 5A — Trakt inbound observer
+
+Outbound is **Hub canonical → providers**. Inbound is **provider watcher →
+canonical candidate**. The inbound tables are independent of canonical ratings
+and the transactional outbox. Phase 5A is **OBSERVE ONLY**, movies only, with
+manual baseline and manual polling. There are no canonical imports, recurring
+Compose services, or timers.
+
+Use the existing authenticated Trakt account to fetch all movie-rating pages:
+
+```bash
+python -m hub.inbound.trakt --baseline
+python -m hub.inbound.trakt --once --observe-only
+```
+
+An explicit first baseline is a watermark: existing ratings produce zero events.
+A subsequent baseline is refused unless `--baseline --reset` is explicitly
+requested. Reset changes the watermark and trusted snapshot but preserves the
+event audit. Missing TMDb mappings are validated, counted and stored separately
+in `inbound_unmapped`; they cannot generate canonical candidates.
+
+A complete snapshot validates every item, pagination header and item count,
+normalizes timezone-aware timestamps to UTC, and rejects duplicate movie keys.
+One bounded deadline covers every page. Publication of the snapshot, its state
+generation and detected events uses a single SQLite transaction. Generation
+checks reject concurrent stale polls; failed polls retain the prior snapshot
+and create no partial events. Event fingerprints include the occurrence
+generation, retaining genuine repeated score cycles while restart/replay of a
+published snapshot produces no duplicate events. A timestamp-only change
+updates the trusted snapshot without generating a rating-change event.
+
+The pure classifier labels same-as-canonical scores and matching completed
+Trakt outbound jobs as echo candidates, defers pending/processing/failed Trakt
+jobs, and identifies differing ratings as candidates for a future importer.
+These hints do not prove user intent and are not authorization to import.
+Baseline-era removals without an active canonical rating cannot manufacture
+canonical tombstones or provider remove jobs.
+
+The loop rule for any future applied event is: **the origin provider is never an
+outbound target for that imported event**. With normal production targets
+`tmdb,trakt,simkl,mdblist`, Trakt-originated events would use
+`targets_excluding_source(settings.targets, "trakt")`, yielding
+`tmdb,simkl,mdblist`. Ordinary Nuvio writes retain all four targets.
+
+`TRAKT_INBOUND_ENABLED=false`, `TRAKT_INBOUND_MEDIA_TYPES=movie` and
+`TRAKT_INBOUND_POLL_SECONDS=300` are safe source defaults. Explicit manual
+observer commands work while automatic inbound is disabled. Enabling that flag
+does not install a service or provide an apply mode. Phase 5A event statuses are
+only `observed` or `ignored`; never `applied`. Tokens, titles, complete histories
+and raw provider bodies are excluded from logs and inbound audit metadata.
