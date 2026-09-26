@@ -5,6 +5,7 @@ import argparse
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
@@ -37,6 +38,14 @@ _SAFE_PILOT_MESSAGES = {
         'Pilot blocked: original rating restoration could not be verified',
     'TMDb settle verifier is required':
         'Pilot blocked: TMDb settle verification is unavailable',
+    'Trakt rating state could not be verified':
+        'Pilot blocked: Trakt rating state could not be verified',
+    'Trakt original rating restoration could not be verified':
+        'Pilot blocked: Trakt original rating restoration could not be verified',
+    'Trakt rated_at restoration could not be verified':
+        'Pilot blocked: Trakt rated_at restoration could not be verified',
+    'Trakt settle verifier is required':
+        'Pilot blocked: Trakt settle verification is unavailable',
 }
 
 
@@ -102,38 +111,59 @@ def read_state(name: str, tmdb_id: int, provider: object, client: object,
 
     if name == 'trakt':
         from hub.providers.trakt import BASE_URL
+        deadline = time.monotonic() + timeout if timeout is not None else None
         matches = []
         page = 1
+        pagination: tuple[int, int, int] | None = None
+        seen_items = 0
         while True:
+            options = {}
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise PilotBlocked('Trakt rating state could not be verified')
+                options['timeout'] = min(10.0, remaining)
             response = client.get(
                 f'{BASE_URL}/users/me/ratings/movies',
-                params={'page': str(page), 'limit': '250'}, headers=provider.headers,
+                params={'page': str(page), 'limit': '250'},
+                headers=provider.headers, **options,
             )
             items = _json(response)
             if not isinstance(items, list):
                 raise PilotBlocked('Trakt ratings response was incomplete')
+            try:
+                response_page = int(response.headers['X-Pagination-Page'])
+                page_count = int(response.headers['X-Pagination-Page-Count'])
+                page_limit = int(response.headers['X-Pagination-Limit'])
+                item_count = int(response.headers['X-Pagination-Item-Count'])
+            except (KeyError, ValueError):
+                raise PilotBlocked('Trakt pagination was invalid') from None
+            if (response_page != page or not 0 <= page_count <= 1000
+                    or not 1 <= page_limit <= 250 or item_count < 0
+                    or len(items) > page_limit
+                    or (page_count == 0 and (page != 1 or items or item_count != 0))
+                    or (page_count > 0 and not 1 <= page <= page_count)):
+                raise PilotBlocked('Trakt pagination was inconsistent')
+            current_pagination = (page_count, page_limit, item_count)
+            if pagination is not None and current_pagination != pagination:
+                raise PilotBlocked('Trakt pagination changed during verification')
+            pagination = current_pagination
+            seen_items += len(items)
             for item in items:
                 if not isinstance(item, dict):
                     raise PilotBlocked('Trakt rating item was malformed')
                 movie = item.get('movie')
                 ids = movie.get('ids') if isinstance(movie, dict) else None
-                if isinstance(ids, dict) and str(ids.get('tmdb')) == str(tmdb_id):
+                item_tmdb_id = ids.get('tmdb') if isinstance(ids, dict) else None
+                if type(item_tmdb_id) is not int or item_tmdb_id <= 0:
+                    raise PilotBlocked('Trakt rating item was malformed')
+                if item_tmdb_id == tmdb_id:
                     matches.append(item)
-            pages = response.headers.get('X-Pagination-Page-Count')
-            if pages is not None:
-                try:
-                    page_count = int(pages)
-                except ValueError as exc:
-                    raise PilotBlocked('Trakt pagination was invalid') from exc
-                if page_count < page:
-                    raise PilotBlocked('Trakt pagination was inconsistent')
-                if page >= page_count:
-                    break
-            elif len(items) < 250:
+            if page_count == 0 or page >= page_count:
+                if seen_items != item_count:
+                    raise PilotBlocked('Trakt pagination item count was inconsistent')
                 break
             page += 1
-            if page > 1000:
-                raise PilotBlocked('Trakt ratings exceeded safe pagination limit')
         if len(matches) > 1:
             raise PilotBlocked('Trakt returned duplicate matching ratings')
         if not matches:
@@ -143,7 +173,10 @@ def read_state(name: str, tmdb_id: int, provider: object, client: object,
         score = _rating(matches[0].get('rating'))
         if score is None or not score.is_integer():
             raise PilotBlocked('Trakt rating was not an integer')
-        return State(score, rated_at=matches[0].get('rated_at'))
+        rated_at = matches[0].get('rated_at')
+        if not isinstance(rated_at, str) or not rated_at:
+            raise PilotBlocked('Trakt rated_at was missing')
+        return State(score, rated_at=rated_at)
 
     if name == 'simkl':
         from hub.providers.simkl import BASE_URL
@@ -195,10 +228,17 @@ def pilot(name: str, payload: dict[str, object], provider: Delivery,
           read: Callable[[], State], first: int = 7, second: int = 9, *,
           verify: Callable[[float | None, State, bool], State] | None = None) -> list[str]:
     """Verify each transition and attempt rollback even after uncertain writes."""
-    original = read()
+    try:
+        original = read()
+    except PilotBlocked as exc:
+        if name == 'trakt':
+            raise PilotBlocked('Trakt rating state could not be verified') from exc
+        raise
     _ensure_safe(name, original, original)
-    if name == 'tmdb' and verify is None:
-        raise PilotBlocked('TMDb settle verifier is required')
+    if name in {'tmdb', 'trakt'} and verify is None:
+        message = ('TMDb settle verifier is required' if name == 'tmdb'
+                   else 'Trakt settle verifier is required')
+        raise PilotBlocked(message)
     events = ['original state read']
     attempted = False
     failure: Exception | None = None
@@ -206,7 +246,7 @@ def pilot(name: str, payload: dict[str, object], provider: Delivery,
         for score in (first, second):
             attempted = True  # A timed-out write may have reached the provider.
             provider.deliver('upsert', {**payload, 'rating': score})
-            if name == 'tmdb':
+            if name in {'tmdb', 'trakt'}:
                 current = verify(score, original, False)  # type: ignore[misc]
                 _ensure_safe(name, original, current)
                 if current.rating != score:
@@ -229,26 +269,32 @@ def pilot(name: str, payload: dict[str, object], provider: Delivery,
                         **payload, 'rating': original.rating,
                         'rated_at': original.rated_at,
                     })
-                if name == 'tmdb':
+                if name in {'tmdb', 'trakt'}:
                     restored = verify(original.rating, original, True)  # type: ignore[misc]
                     _ensure_safe(name, original, restored)
                     if restored.rating != original.rating:
                         raise PilotBlocked('provider settle verification returned an unexpected state')
+                    if (name == 'trakt' and original.rating is not None
+                            and restored.rated_at != original.rated_at):
+                        raise PilotBlocked('Trakt rated_at restoration could not be verified')
                 else:
                     restored = read()
                     _ensure_safe(name, original, restored)
                     if restored.rating != original.rating:
                         raise PilotBlocked('original rating was not restored')
-                    if (name == 'trakt' and original.rating is not None
-                            and restored.rated_at != original.rated_at):
-                        raise PilotBlocked('original Trakt rated_at was not restored')
                 events.append('original rating verified restored')
             except PilotBlocked as exc:
+                if name == 'trakt':
+                    if str(exc) == 'Trakt rated_at restoration could not be verified':
+                        raise
+                    raise PilotBlocked('Trakt original rating restoration could not be verified') from exc
                 raise PilotBlocked('rollback could not be verified; manual review required') from exc
             except Exception as exc:
                 raise RuntimeError('pilot rollback failed') from exc
     if failure is not None:
         if type(failure) is PilotBlocked:
+            if name == 'trakt':
+                raise PilotBlocked('Trakt rating state could not be verified') from failure
             raise PilotBlocked('pilot stopped after failed write or verification') from failure
         raise RuntimeError('pilot failed') from failure
     return events
@@ -295,22 +341,29 @@ def main(argv: list[str] | None = None) -> int:
         payload = {'media_type': 'movie', 'tmdb_id': tmdb_id, 'content_key': args.content}
         with httpx.Client(timeout=10.0, follow_redirects=False) as client:
             verify = None
-            if args.provider == 'tmdb':
-                from scripts.settle_verifier import (
-                    ROLLBACK_POLICY,
-                    UPSERT_POLICY,
-                    tmdb_account_id,
-                    tmdb_rated_movie_rating,
-                    wait_for_state,
-                )
-                account_id = tmdb_account_id(provider, client, 10.0)
+            if args.provider in {'tmdb', 'trakt'}:
+                try:
+                    from scripts.settle_verifier import (
+                        ROLLBACK_POLICY,
+                        UPSERT_POLICY,
+                        tmdb_account_id,
+                        tmdb_rated_movie_rating,
+                        wait_for_state,
+                    )
+                except Exception as exc:
+                    message = ('TMDb settle verifier is required'
+                               if args.provider == 'tmdb'
+                               else 'Trakt settle verifier is required')
+                    raise PilotBlocked(message) from exc
+                account_id = (tmdb_account_id(provider, client, 10.0)
+                              if args.provider == 'tmdb' else None)
 
                 def verify(expected: float | None, original: State,
                            rollback: bool) -> State:
                     return wait_for_state(
-                        'tmdb', original, expected,
+                        args.provider, original, expected,
                         lambda remaining: read_state(
-                            'tmdb', tmdb_id, provider, client,
+                            args.provider, tmdb_id, provider, client,
                             timeout=min(10.0, remaining),
                         ),
                         policy=ROLLBACK_POLICY if rollback else UPSERT_POLICY,
@@ -319,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
                             lambda remaining: tmdb_rated_movie_rating(
                                 tmdb_id, account_id, provider, client, remaining,
                             )
-                        ) if rollback else None,
+                        ) if rollback and args.provider == 'tmdb' else None,
                     )
             events = pilot(args.provider, payload, provider,
                            lambda: read_state(args.provider, tmdb_id, provider, client),

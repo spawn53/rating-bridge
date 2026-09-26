@@ -1,6 +1,6 @@
-# TMDb settle verification
+# TMDb and Trakt settle verification
 
-Status: integrated into the explicitly gated `scripts/live_pilot.py` command. The
+Status: TMDb and Trakt verification are integrated into the explicitly gated `scripts/live_pilot.py` command. The
 API and worker never invoke the pilot. Deployment of this code does not authorize
 a provider write; every live pilot still requires `--confirm-live-write` and a
 separate explicit operational authorization.
@@ -41,8 +41,8 @@ message cannot reconstruct which intermediate verification event occurred.
 and injectable monotonic clock/sleep. Readers receive the remaining I/O budget.
 It polls read-only, requires consecutive matching observations and a minimum
 matching duration, and resets both on read errors or disagreement. Watchlist
-and library safety failures abort immediately. Trakt timestamp restoration is
-preserved if this generic helper is later reviewed for that provider.
+and library safety failures abort immediately. For Trakt rollback of an existing
+rating, every matching sample must also preserve the exact original rated_at value.
 
 Ordinary upsert policy: 60-second budget, 2-second polling interval, at least
 three consecutive matches spanning at least four seconds. It may return early.
@@ -52,8 +52,8 @@ an early matching streak cannot produce early success. At window end the latest
 streak must still meet both requirements. The last observation can precede the
 end by up to one polling interval. Errors or a rebound reset the streak.
 
-These are conservative, configurable operational budgets, not measured TMDb
-propagation constants or a published service guarantee. The two-minute rollback
+These are conservative, configurable operational budgets, not measured TMDb or
+Trakt propagation constants or published service guarantees. The two-minute rollback
 budget follows the bounded investigation horizon; slower polling keeps request
 volume bounded while covering a longer period than upsert verification. The
 matching durations follow directly from the sample counts and intervals. Review
@@ -67,6 +67,15 @@ numeric identity to the helper, which checks all rated pages. It rejects
 incomplete or changing pagination, malformed values, duplicate target entries,
 and scan limits. Missing movies mean absence only after a complete scan. Both
 surfaces must agree on the expected original rating for every matching sample.
+
+For Trakt, the authenticated /users/me/ratings/movies reader requests at
+most 250 items per page and scans every page before accepting absence. It validates
+the pagination headers and stable totals, item counts, target IDs, rating values and
+rated_at; malformed responses and duplicate target entries fail closed. Trakt has
+one authoritative personal-rating surface, so rollback uses the entire 120-second
+window. An originally unrated movie must remain absent, while an existing rating
+must match both its score and original timestamp throughout the required final
+streak.
 
 Readers must enforce the supplied remaining deadline on their I/O. The TMDb
 secondary reader clamps each request timeout to the remaining budget and rejects

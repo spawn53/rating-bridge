@@ -34,6 +34,15 @@ def fake_settle(fake: FakeDelivery, calls: list[tuple[float | None, bool]] | Non
     return verify
 
 
+def trakt_headers(page: int, pages: int, item_count: int, limit: int = 250):
+    return {
+        'X-Pagination-Page': str(page),
+        'X-Pagination-Page-Count': str(pages),
+        'X-Pagination-Limit': str(limit),
+        'X-Pagination-Item-Count': str(item_count),
+    }
+
+
 def test_cli_refuses_without_explicit_confirmation(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(['--provider', 'tmdb', '--content', 'movie:tmdb:550']) == 2
     assert 'confirm-live-write' in capsys.readouterr().out
@@ -63,7 +72,8 @@ def test_original_trakt_timestamp_is_passed_to_restoration() -> None:
         payloads.append(payload)
         fake.deliver(action, payload)
     wrapper = SimpleNamespace(deliver=deliver)
-    pilot('trakt', {'media_type': 'movie', 'tmdb_id': 550}, wrapper, lambda: fake.state)
+    pilot('trakt', {'media_type': 'movie', 'tmdb_id': 550}, wrapper, lambda: fake.state,
+          verify=fake_settle(fake))
     assert payloads[-1]['rated_at'] == '2020-01-01T00:00:00Z'
 
 
@@ -116,7 +126,7 @@ def test_trakt_read_uses_personal_rating_and_id() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == 'GET'
         assert request.url.path == '/users/me/ratings/movies'
-        return httpx.Response(200, headers={'X-Pagination-Page-Count': '1'}, json=[
+        return httpx.Response(200, headers=trakt_headers(1, 1, 1), json=[
             {'rating': 6, 'rated_at': '2020-01-01T00:00:00Z',
              'movie': {'ids': {'tmdb': 550}}},
         ])
@@ -167,6 +177,12 @@ def test_operator_failure_exposes_only_allowlisted_pilot_reasons() -> None:
     )
     assert operator_failure(PilotBlocked('TMDb account state was incomplete')) == (
         'Pilot blocked: TMDb account state could not be verified'
+    )
+    assert operator_failure(PilotBlocked('Trakt rating state could not be verified')) == (
+        'Pilot blocked: Trakt rating state could not be verified'
+    )
+    assert operator_failure(PilotBlocked('Trakt settle verifier is required')) == (
+        'Pilot blocked: Trakt settle verification is unavailable'
     )
     marker = 'https://example.invalid/?session_id=sensitive-marker-123'
     for error in (PilotBlocked(marker), RuntimeError(marker)):
@@ -443,3 +459,212 @@ def test_tmdb_cross_check_http_failure_does_not_expose_session_or_body():
     assert marker not in str(error.value)
     assert 'private-response-body' not in str(error.value)
     assert error.value.__suppress_context__
+
+
+def trakt_settle(values, *, original=None, expected=7, rollback=False, timeout=5):
+    timer = FakeClock()
+    original = original or State(None)
+    required = 5 if rollback else 3
+    stable_seconds = 4 if rollback else 2
+    reader = Samples(values)
+    result = wait_for_state(
+        'trakt', original, expected, reader,
+        policy=SettlePolicy(timeout, 1, required, stable_seconds, full_window=rollback),
+        rollback=rollback, clock=timer.clock, sleep=timer.sleep,
+    )
+    return result, timer.now, reader.index
+
+
+def test_trakt_settle_verifier_is_required_before_any_write():
+    fake = FakeDelivery(State(None))
+    with pytest.raises(PilotBlocked, match='Trakt settle verifier') as error:
+        pilot('trakt', {'media_type': 'movie', 'tmdb_id': 550},
+              fake, lambda: fake.state)
+    assert fake.calls == []
+    assert operator_failure(error.value) == (
+        'Pilot blocked: Trakt settle verification is unavailable'
+    )
+
+
+def test_trakt_pilot_verifies_both_upserts_and_rollback():
+    fake = FakeDelivery(State(None))
+    verified = []
+    events = pilot('trakt', {'media_type': 'movie', 'tmdb_id': 550},
+                   fake, lambda: fake.state, verify=fake_settle(fake, verified))
+    assert verified == [(7, False), (9, False), (None, True)]
+    assert events[-1] == 'original rating verified restored'
+
+
+def test_trakt_pilot_rejects_wrong_restored_timestamp():
+    original = State(6, rated_at='2024-01-01T00:00:00Z')
+    fake = FakeDelivery(original)
+    def verify(expected, initial, rollback):
+        if rollback:
+            return State(6, rated_at='2024-01-02T00:00:00Z')
+        return fake.state
+    with pytest.raises(PilotBlocked, match='rated_at restoration') as error:
+        pilot('trakt', {'media_type': 'movie', 'tmdb_id': 550},
+              fake, lambda: fake.state, verify=verify)
+    assert operator_failure(error.value) == (
+        'Pilot blocked: Trakt rated_at restoration could not be verified'
+    )
+
+
+def test_trakt_settle_delayed_write_visibility():
+    states = [State(None), State(None), State(7), State(7), State(7)]
+    result, elapsed, calls = trakt_settle(states)
+    assert result.rating == 7 and elapsed == 4 and calls == 5
+
+
+def test_trakt_settle_rebound_does_not_pass_early():
+    states = [State(None), State(7), State(7), State(None), State(7)]
+    with pytest.raises(PilotBlocked, match='timed out'):
+        trakt_settle(states)
+
+
+def test_trakt_settle_stable_removal_uses_full_window():
+    states = [State(7), State(7), State(None), State(None), State(None),
+              State(None), State(None)]
+    result, elapsed, calls = trakt_settle(
+        states, expected=None, rollback=True, timeout=7,
+    )
+    assert result.rating is None and elapsed == 7 and calls == 7
+
+
+def test_trakt_settle_late_reappearance_fails_rollback():
+    states = [State(None), State(None), State(None), State(7)]
+    with pytest.raises(PilotBlocked, match='timed out'):
+        trakt_settle(states, expected=None, rollback=True, timeout=7)
+
+
+def test_trakt_settle_existing_rating_requires_original_timestamp():
+    original = State(6, rated_at='2024-01-01T00:00:00Z')
+    wrong = [State(6, rated_at='2024-01-02T00:00:00Z')]
+    with pytest.raises(PilotBlocked, match='timed out'):
+        trakt_settle(wrong, original=original, expected=6, rollback=True)
+    correct = [State(6, rated_at=original.rated_at)]
+    result, elapsed, calls = trakt_settle(
+        correct, original=original, expected=6, rollback=True,
+    )
+    assert result == original and elapsed == 5 and calls == 5
+
+
+def test_trakt_settle_read_error_resets_streak():
+    states = [State(7), RuntimeError('private-read-detail'), State(7), State(7)]
+    with pytest.raises(PilotBlocked, match='timed out') as error:
+        trakt_settle(states, timeout=4)
+    assert 'private-read-detail' not in str(error.value)
+
+
+def test_trakt_settle_timeout_fails():
+    with pytest.raises(PilotBlocked, match='timed out'):
+        trakt_settle([State(None)], timeout=4)
+
+
+def test_trakt_reader_finds_target_beyond_first_page():
+    pages_seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params['page'])
+        pages_seen.append(page)
+        item = ({'rating': 8, 'rated_at': '2024-02-03T04:05:06Z',
+                 'movie': {'ids': {'tmdb': 550}}}
+                if page == 2 else
+                {'rating': 5, 'rated_at': '2024-01-01T00:00:00Z',
+                 'movie': {'ids': {'tmdb': 1}}})
+        return httpx.Response(
+            200, headers=trakt_headers(page, 2, 2), json=[item],
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        state = read_state('trakt', 550, SimpleNamespace(headers={}), client)
+    assert pages_seen == [1, 2]
+    assert state == State(8, rated_at='2024-02-03T04:05:06Z')
+
+
+def test_trakt_reader_rejects_duplicate_target_across_pages():
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params['page'])
+        item = {'rating': 7, 'rated_at': f'2024-01-0{page}T00:00:00Z',
+                'movie': {'ids': {'tmdb': 550}}}
+        return httpx.Response(
+            200, headers=trakt_headers(page, 2, 2), json=[item],
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PilotBlocked, match='duplicate'):
+            read_state('trakt', 550, SimpleNamespace(headers={}), client)
+
+
+def test_trakt_reader_rejects_malformed_pagination():
+    failures = ('missing-header', 'wrong-page', 'oversized-limit',
+                'wrong-item-count', 'changed-total')
+    for failure in failures:
+        def handler(request: httpx.Request) -> httpx.Response:
+            page = int(request.url.params['page'])
+            pages = 2 if failure == 'changed-total' and page == 1 else 1
+            headers = trakt_headers(page, pages, 0)
+            if failure == 'missing-header':
+                del headers['X-Pagination-Item-Count']
+            elif failure == 'wrong-page':
+                headers['X-Pagination-Page'] = '2'
+            elif failure == 'oversized-limit':
+                headers['X-Pagination-Limit'] = '251'
+            elif failure == 'wrong-item-count':
+                headers['X-Pagination-Item-Count'] = '1'
+            elif page == 2:
+                headers['X-Pagination-Page-Count'] = '3'
+            return httpx.Response(200, headers=headers, json=[])
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(PilotBlocked, match='pagination'):
+                read_state('trakt', 550, SimpleNamespace(headers={}), client)
+
+
+def test_trakt_reader_accepts_authoritative_empty_result():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers=trakt_headers(1, 0, 0), json=[],
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        assert read_state(
+            'trakt', 550, SimpleNamespace(headers={}), client,
+        ) == State(None)
+
+
+def test_trakt_reader_rejects_malformed_rating_and_timestamp():
+    failures = (
+        {'rating': 7.5, 'rated_at': '2024-01-01T00:00:00Z'},
+        {'rating': 7, 'rated_at': None},
+    )
+    for fields in failures:
+        def handler(request: httpx.Request) -> httpx.Response:
+            item = {**fields, 'movie': {'ids': {'tmdb': 550}}}
+            return httpx.Response(
+                200, headers=trakt_headers(1, 1, 1), json=[item],
+            )
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(PilotBlocked):
+                read_state('trakt', 550, SimpleNamespace(headers={}), client)
+
+
+def test_trakt_read_failure_does_not_expose_body_or_url():
+    body_marker = 'private-trakt-response-body'
+    url_marker = 'private-query-marker'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, text=body_marker)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(httpx.HTTPStatusError) as error:
+            read_state(
+                'trakt', 550,
+                SimpleNamespace(headers={'X-Private-Test': url_marker}), client,
+            )
+    message = operator_failure(error.value)
+    assert body_marker not in message
+    assert url_marker not in message
+    assert 'api.trakt.tv' not in message
+    assert message == 'Pilot blocked or failed; inspect state manually'

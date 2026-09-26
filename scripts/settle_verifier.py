@@ -33,7 +33,7 @@ class SettlePolicy:
             raise ValueError('invalid settle policy')
 
 
-# Operational review defaults, not a claim about TMDb's convergence SLA.
+# Operational review defaults, not claims about provider convergence SLAs.
 UPSERT_POLICY = SettlePolicy(60, 2, 3, 4)
 ROLLBACK_POLICY = SettlePolicy(120, 5, 5, 20, full_window=True)
 
@@ -50,7 +50,7 @@ def wait_for_state(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> State:
-    """Require a stable matching streak; TMDb restoration requires both views.
+    """Require a stable matching streak with provider-specific rollback checks.
 
     Rollback uses its entire observation budget. An error or disagreement resets
     the streak; watchlist/library safety failures abort immediately. A deadline
