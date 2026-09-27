@@ -8,7 +8,7 @@ import re
 from typing import Iterable
 
 from hub.inbound.classification import classify
-from hub.inbound.importer import apply_event, GLOBAL_TARGETS
+from hub.inbound.importer import apply_event, validated_delivery_targets
 from hub.inbound.models import InboundError, timestamp, validate_media_type
 from hub.inbound.removal import apply_removal_event
 from hub.inbound.storage import InboundStore
@@ -113,7 +113,8 @@ def auto_apply(store: InboundStore, targets: Iterable[str], *, generation: int,
     try:
         media_type = validate_media_type(store.media_type)
         targets = tuple(targets)
-        if (targets != GLOBAL_TARGETS or type(max_events) is not int or not 1 <= max_events <= 100
+        validated_delivery_targets(targets)
+        if (type(max_events) is not int or not 1 <= max_events <= 100
                 or type(echo_grace_seconds) is not int or not 0 <= echo_grace_seconds <= 86400
                 or type(generation) is not int or generation < 1):
             raise InboundError("Automatic application settings are invalid")

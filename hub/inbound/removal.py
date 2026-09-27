@@ -8,7 +8,7 @@ import sqlite3
 from typing import Callable, Iterable
 
 from hub.inbound.classification import classify, targets_excluding_source
-from hub.inbound.importer import GLOBAL_TARGETS, TARGETS
+from hub.inbound.importer import validated_delivery_targets
 from hub.inbound.models import InboundError, timestamp, validate_media_type
 from hub.inbound.storage import InboundStore
 from hub.store import RatingStore
@@ -62,7 +62,8 @@ def _absence(conn: sqlite3.Connection, event: dict, media_type: str) -> None:
         raise InboundError("A newer inbound event supersedes this removal")
 
 
-def _verify_committed(conn: sqlite3.Connection, event: dict, expected_revision: int, media_type: str) -> dict:
+def _verify_committed(conn: sqlite3.Connection, event: dict, expected_revision: int,
+                      media_type: str, expected_targets: tuple[str, ...]) -> dict:
     canonical, trakt_jobs = InboundStore._context(conn, event["content_key"])
     if (canonical is None or canonical["deleted"] != 1 or canonical["rating"] is not None
             or canonical["revision"] != expected_revision + 1
@@ -80,24 +81,28 @@ def _verify_committed(conn: sqlite3.Connection, event: dict, expected_revision: 
         (event["content_key"], canonical["revision"]),
     )]
     try:
-        valid = (len(jobs) == 3 and {j["target"] for j in jobs} == set(TARGETS)
+        valid = (len(jobs) == len(expected_targets)
+                 and {j["target"] for j in jobs} == set(expected_targets)
                  and all(j["action"] == "remove" and json.loads(j["payload_json"]) == canonical for j in jobs))
     except (ValueError, TypeError):
         valid = False
     if not valid:
-        raise InboundError("Committed removal audit does not match exactly three tombstone jobs")
+        raise InboundError("Committed removal audit does not match the audited tombstone jobs")
     return canonical
 
 
 def _mark_applied(store: InboundStore, *, event_id: int, key: str, generation: int,
-                  old_rating: int, expected_revision: int, fingerprint: str) -> int:
+                  old_rating: int, expected_revision: int, fingerprint: str,
+                  expected_targets: tuple[str, ...]) -> int:
     with store.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         event = _event(conn, event_id, key, generation, old_rating, expected_revision, store.media_type)
         if event["fingerprint"] != fingerprint:
             raise InboundError("Removal fingerprint changed before audit completion")
         _absence(conn, event, store.media_type)
-        canonical = _verify_committed(conn, event, expected_revision, store.media_type)
+        canonical = _verify_committed(
+            conn, event, expected_revision, store.media_type, expected_targets
+        )
         if event["status"] != "applied":
             changed = conn.execute("""
                 UPDATE inbound_events SET status='applied',applied_at=?,canonical_revision=?
@@ -131,9 +136,7 @@ def apply_removal_event(store: InboundStore, targets: Iterable[str], *, event_id
             or expected_source == f"trakt-inbound:{event_id}"):
         raise InboundError("Removal import expectations were invalid")
     targets = tuple(targets)
-    derived = targets_excluding_source(targets, "trakt")
-    if targets != GLOBAL_TARGETS or derived != TARGETS:
-        raise InboundError("Removal requires the unchanged four targets and exact source exclusion")
+    derived = validated_delivery_targets(targets)
     canonical_store = RatingStore(store.path)
     replayed = False
     with store.connect() as conn:
@@ -148,7 +151,7 @@ def apply_removal_event(store: InboundStore, targets: Iterable[str], *, event_id
         _absence(conn, event, media_type)
         canonical, jobs = store._context(conn, expected_key)
         if canonical is not None and canonical["source"] == f"trakt-inbound:{event_id}":
-            canonical = _verify_committed(conn, event, expected_revision, media_type)
+            canonical = _verify_committed(conn, event, expected_revision, media_type, derived)
             revision, queued, replayed = canonical["revision"], [], True
         else:
             if (canonical is None or canonical["media_type"] != media_type
@@ -164,12 +167,12 @@ def apply_removal_event(store: InboundStore, targets: Iterable[str], *, event_id
             result = canonical_store.delete_rating(expected_key, derived,
                                                    source=f"trakt-inbound:{event_id}", connection=conn)
             revision, queued = result["revision"], result["queued_targets"]
-            if not result["removed"] or revision != expected_revision + 1 or tuple(queued) != TARGETS:
-                raise InboundError("Removal did not produce exactly one revision and three jobs")
-            _verify_committed(conn, event, expected_revision, media_type)
+            if not result["removed"] or revision != expected_revision + 1 or tuple(queued) != derived:
+                raise InboundError("Removal did not produce exactly one revision and the audited jobs")
+            _verify_committed(conn, event, expected_revision, media_type, derived)
     marked = _mark_applied(store, event_id=event_id, key=expected_key, generation=expected_generation,
                            old_rating=expected_old_rating, expected_revision=expected_revision,
-                           fingerprint=event["fingerprint"])
+                           fingerprint=event["fingerprint"], expected_targets=derived)
     return {"event_id": event_id, "content_key": expected_key, "revision": marked, "removed": True,
             "queued_targets": queued, "skipped_targets": ["trakt"], "already_applied": replayed,
             "direct_provider_writes": 0}

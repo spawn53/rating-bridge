@@ -15,6 +15,29 @@ from hub.store import RatingStore
 
 TARGETS = ("tmdb", "simkl", "mdblist")
 GLOBAL_TARGETS = ("tmdb", "trakt", "simkl", "mdblist")
+IMDB_TARGETS = TARGETS + ("imdb",)
+IMDB_GLOBAL_TARGETS = GLOBAL_TARGETS + ("imdb",)
+
+_TARGET_PLANS = {
+    GLOBAL_TARGETS: TARGETS,
+    IMDB_GLOBAL_TARGETS: IMDB_TARGETS,
+}
+
+
+def validated_delivery_targets(targets: Iterable[str]) -> tuple[str, ...]:
+    """Accept only explicitly audited Trakt-origin target plans.
+
+    This is intentionally not capability-derived: adding a provider to global
+    settings must never silently expand automatic Trakt fan-out.
+    """
+    plan = tuple(targets)
+    expected = _TARGET_PLANS.get(plan)
+    if expected is None:
+        raise InboundError("Trakt inbound target plan is not explicitly audited")
+    derived = targets_excluding_source(plan, "trakt")
+    if derived != expected:
+        raise InboundError("Trakt source exclusion did not match the audited target plan")
+    return derived
 
 
 def _event(conn: sqlite3.Connection, event_id: int, key: str, rating: int,
@@ -75,7 +98,7 @@ def _snapshot(conn: sqlite3.Connection, event: dict) -> MovieRating | ShowRating
 
 
 def _verify_committed(conn: sqlite3.Connection, event: dict, movie: MovieRating | ShowRating,
-                      expected_revision: int) -> dict:
+                      expected_revision: int, expected_targets: tuple[str, ...]) -> dict:
     canonical, trakt_jobs = InboundStore._context(conn, event["content_key"])
     # Apply the same causal scope during crash recovery as before first import.
     decision = classify(event["content_key"], movie.rating, canonical, trakt_jobs)
@@ -95,21 +118,23 @@ def _verify_committed(conn: sqlite3.Connection, event: dict, movie: MovieRating 
         "SELECT * FROM outbox WHERE content_key=? AND revision=?",
         (event["content_key"], canonical["revision"]),
     )]
-    if (len(jobs) != 3 or {j["target"] for j in jobs} != set(TARGETS)
+    if (len(jobs) != len(expected_targets)
+            or {j["target"] for j in jobs} != set(expected_targets)
             or any(j["action"] != "upsert" or json.loads(j["payload_json"]) != canonical for j in jobs)):
-        raise InboundError("Committed inbound delivery audit does not match the three allowed targets")
+        raise InboundError("Committed inbound delivery audit does not match the audited target plan")
     return canonical
 
 
 def _mark_applied(store: InboundStore, *, event_id: int, key: str, rating: int,
-                  generation: int, expected_revision: int, fingerprint: str) -> int:
+                  generation: int, expected_revision: int, fingerprint: str,
+                  expected_targets: tuple[str, ...]) -> int:
     with store.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         event = _event(conn, event_id, key, rating, generation, store.media_type)
         if event["fingerprint"] != fingerprint:
             raise InboundError("Inbound event identity changed before audit completion")
         movie = _snapshot(conn, event)
-        canonical = _verify_committed(conn, event, movie, expected_revision)
+        canonical = _verify_committed(conn, event, movie, expected_revision, expected_targets)
         if event["status"] == "applied":
             if event["canonical_revision"] != canonical["revision"]:
                 raise InboundError("Inbound applied revision audit was inconsistent")
@@ -129,7 +154,7 @@ def apply_event(store: InboundStore, targets: Iterable[str], *, event_id: int,
 
     BEGIN IMMEDIATE holds validation through the canonical commit. A crash in
     the following audit gap is recovered only by exact provenance and a complete
-    three-job payload audit, never by score equality alone.
+    exact target-plan payload audit, never by score equality alone.
     """
     media_type = validate_media_type(store.media_type)
     if confirmed is not True:
@@ -142,9 +167,7 @@ def apply_event(store: InboundStore, targets: Iterable[str], *, event_id: int,
             or type(expected_revision) is not int or expected_revision < 0):
         raise InboundError("Single-event import expectations were invalid")
     targets = tuple(targets)
-    derived = targets_excluding_source(targets, "trakt")
-    if targets != GLOBAL_TARGETS or derived != TARGETS:
-        raise InboundError("Single-event import requires the unchanged four targets and exact source exclusion")
+    derived = validated_delivery_targets(targets)
     canonical_store = RatingStore(store.path)
     replayed = False
     with store.connect() as conn:
@@ -162,7 +185,7 @@ def apply_event(store: InboundStore, targets: Iterable[str], *, event_id: int,
         movie = _snapshot(conn, event)
         canonical, jobs = store._context(conn, expected_key)
         if canonical is not None and canonical["source"] == f"trakt-inbound:{event_id}":
-            canonical = _verify_committed(conn, event, movie, expected_revision)
+            canonical = _verify_committed(conn, event, movie, expected_revision, derived)
             revision = canonical["revision"]
             queued = []
             replayed = True
@@ -189,12 +212,12 @@ def apply_event(store: InboundStore, targets: Iterable[str], *, event_id: int,
                                source=f"trakt-inbound:{event_id}")
             result = canonical_store.upsert_rating(item, derived, connection=conn)
             revision, queued = result["revision"], result["queued_targets"]
-            if revision != expected_revision + 1 or tuple(queued) != TARGETS:
-                raise InboundError("Canonical import did not produce exactly one revision and three jobs")
+            if revision != expected_revision + 1 or tuple(queued) != derived:
+                raise InboundError("Canonical import did not produce exactly one revision and the audited jobs")
     # No automatic retry or provider call occurs here. Tests simulate a crash at this boundary.
     marked = _mark_applied(store, event_id=event_id, key=expected_key, rating=expected_rating,
                            generation=expected_generation, expected_revision=expected_revision,
-                           fingerprint=event["fingerprint"])
+                           fingerprint=event["fingerprint"], expected_targets=derived)
     return {"event_id": event_id, "content_key": expected_key, "rating": expected_rating,
             "revision": marked, "queued_targets": queued, "skipped_targets": ["trakt"],
             "already_applied": replayed}

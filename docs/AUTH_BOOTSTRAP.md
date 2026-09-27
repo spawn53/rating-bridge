@@ -82,3 +82,18 @@ Live IMDb mutations use a conservative configurable delay
 (`IMDB_V2_WRITE_DELAY_SECONDS`, default 2 seconds) and read-after-write
 verification by default (`IMDB_V2_VERIFY_WRITES=true`). Missing canonical IMDb
 IDs are treated as permanent unsupported deliveries rather than retried.
+
+
+### Trakt inbound IMDb target-plan gate
+
+The guarded Trakt importer does not derive automatic fan-out from the global
+capability table. It accepts only two exact, ordered plans: the established
+`tmdb,trakt,simkl,mdblist` plan and the separately audited
+`tmdb,trakt,simkl,mdblist,imdb` plan. Trakt remains excluded as the source, so
+the latter produces exactly four transactional outbox jobs:
+TMDb, Simkl, MDBList and IMDb. Any missing, reordered, duplicated, unknown or
+Letterboxd-containing plan fails closed before canonical mutation.
+
+This code path may be merged/deployed while production remains on the four
+stable global targets; IMDb is not activated until the environment and provider
+flags are changed in a later controlled phase.
