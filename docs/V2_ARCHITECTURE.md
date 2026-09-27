@@ -419,8 +419,15 @@ imports use `--apply-event <id> --media-type show` with explicit key, rating,
 generation, existing revision and `--confirm-live-import` expectations. The shared
 movie/show importer commits canonical state and exactly three jobs (TMDb, Simkl,
 MDBList), excludes Trakt, and recovers audit-gap crashes only from exact
-provenance and canonical/outbox payload audit. Show removal import,
-reclassification, auto-apply and scheduled polling remain disabled and fail closed.
+provenance and canonical/outbox payload audit. Guarded manual removal supports
+movies and shows with the same explicit content key, generation, old rating,
+canonical revision/source and confirmation flags. It commits one tombstone and
+exactly three removal jobs (TMDb, Simkl and MDBList), excludes Trakt, and retains
+identity and the original provider rating timestamp. The new canonical update
+timestamp and event application timestamp record the import; detection time is
+unchanged. Repeating an applied event is idempotent, and recovery of an interrupted
+audit requires the exact committed tombstone and payloads. Show reclassification,
+auto-apply and scheduled polling remain disabled and fail closed.
 Episode/season inbound observation is unsupported. Existing show ratings captured
 by the baseline are historical source state: they create no events, canonical
 ratings or outbox jobs and are never automatically backfilled.

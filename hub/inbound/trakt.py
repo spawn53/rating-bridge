@@ -148,8 +148,8 @@ def main(argv: list[str] | None = None) -> int:
     applying = args.apply_event is not None
     reclassifying = args.reclassify_event is not None
     removing = args.apply_removal_event is not None
-    if args.media_type != "movie" and (args.scheduled_observe or removing or reclassifying):
-        print("Trakt show removal, reclassification and scheduling refused; observe-only or guarded manual upsert required")
+    if args.media_type != "movie" and (args.scheduled_observe or reclassifying):
+        print("Trakt show reclassification and scheduling refused; observe-only or guarded manual import required")
         return 2
     expectations = (args.expect_content_key, args.expect_rating,
                     args.expect_generation, args.expect_canonical_revision)

@@ -9,18 +9,20 @@ from typing import Callable, Iterable
 
 from hub.inbound.classification import classify, targets_excluding_source
 from hub.inbound.importer import GLOBAL_TARGETS, TARGETS
-from hub.inbound.models import InboundError, timestamp
+from hub.inbound.models import InboundError, timestamp, validate_media_type
 from hub.inbound.storage import InboundStore
 from hub.store import RatingStore
 
 
 def _event(conn: sqlite3.Connection, event_id: int, key: str, generation: int,
-           old_rating: int, revision: int) -> dict:
+           old_rating: int, revision: int, media_type: str) -> dict:
+    validate_media_type(media_type)
     row = conn.execute("SELECT * FROM inbound_events WHERE id=?", (event_id,)).fetchone()
     if row is None:
         raise InboundError("Removal event was not found")
     event = dict(row)
-    if (event["provider"] != "trakt" or event["media_type"] != "movie"
+    if (event["provider"] != "trakt" or event["media_type"] != media_type
+            or not re.fullmatch(rf"{media_type}:tmdb:[1-9][0-9]*", event["content_key"])
             or event["event_type"] != "removed" or event["content_key"] != key
             or event["generation"] != generation or event["old_rating"] != old_rating
             or event["new_rating"] is not None or event["status"] not in {"observed", "applied"}
@@ -41,30 +43,32 @@ def _event(conn: sqlite3.Connection, event_id: int, key: str, generation: int,
     return event
 
 
-def _absence(conn: sqlite3.Connection, event: dict) -> None:
+def _absence(conn: sqlite3.Connection, event: dict, media_type: str) -> None:
     state = conn.execute(
-        "SELECT generation FROM inbound_state WHERE provider='trakt' AND media_type='movie'"
+        "SELECT generation FROM inbound_state WHERE provider='trakt' AND media_type=?",
+        (media_type,),
     ).fetchone()
     present = conn.execute(
-        "SELECT 1 FROM inbound_snapshots WHERE provider='trakt' AND media_type='movie' AND content_key=?",
-        (event["content_key"],),
+        "SELECT 1 FROM inbound_snapshots WHERE provider='trakt' AND media_type=? AND content_key=?",
+        (media_type, event["content_key"]),
     ).fetchone()
     if state is None or state[0] != event["generation"] or present is not None:
         raise InboundError("Removal no longer matches trusted snapshot absence and generation")
     newer = conn.execute("""
-        SELECT 1 FROM inbound_events WHERE provider='trakt' AND media_type='movie' AND content_key=?
+        SELECT 1 FROM inbound_events WHERE provider='trakt' AND media_type=? AND content_key=?
         AND (generation>? OR (generation=? AND id>?)) LIMIT 1
-    """, (event["content_key"], event["generation"], event["generation"], event["id"])).fetchone()
+    """, (media_type, event["content_key"], event["generation"], event["generation"], event["id"])).fetchone()
     if newer is not None:
         raise InboundError("A newer inbound event supersedes this removal")
 
 
-def _verify_committed(conn: sqlite3.Connection, event: dict, expected_revision: int) -> dict:
+def _verify_committed(conn: sqlite3.Connection, event: dict, expected_revision: int, media_type: str) -> dict:
     canonical, trakt_jobs = InboundStore._context(conn, event["content_key"])
     if (canonical is None or canonical["deleted"] != 1 or canonical["rating"] is not None
             or canonical["revision"] != expected_revision + 1
             or canonical["source"] != f"trakt-inbound:{event['id']}"
-            or canonical["media_type"] != "movie"
+            or canonical["media_type"] != media_type
+            or canonical["content_key"] != event["content_key"]
             or canonical["tmdb_id"] != int(event["content_key"].rsplit(":", 1)[1])
             or timestamp(canonical["rated_at"]) != timestamp(event["provider_rated_at"])):
         raise InboundError("Canonical tombstone does not match this committed removal")
@@ -89,11 +93,11 @@ def _mark_applied(store: InboundStore, *, event_id: int, key: str, generation: i
                   old_rating: int, expected_revision: int, fingerprint: str) -> int:
     with store.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        event = _event(conn, event_id, key, generation, old_rating, expected_revision)
+        event = _event(conn, event_id, key, generation, old_rating, expected_revision, store.media_type)
         if event["fingerprint"] != fingerprint:
             raise InboundError("Removal fingerprint changed before audit completion")
-        _absence(conn, event)
-        canonical = _verify_committed(conn, event, expected_revision)
+        _absence(conn, event, store.media_type)
+        canonical = _verify_committed(conn, event, expected_revision, store.media_type)
         if event["status"] != "applied":
             changed = conn.execute("""
                 UPDATE inbound_events SET status='applied',applied_at=?,canonical_revision=?
@@ -115,12 +119,11 @@ def apply_removal_event(store: InboundStore, targets: Iterable[str], *, event_id
     can be recovered without another delete or duplicate delivery. Applied events
     return their original audit and never replay against later canonical state.
     """
-    if store.media_type != "movie":
-        raise InboundError("Show inbound observation is observe-only; mutation refused")
+    media_type = validate_media_type(store.media_type)
     if confirmed is not True:
         raise InboundError("Removal import requires --confirm-live-import")
     if (type(event_id) is not int or event_id < 1
-            or not isinstance(expected_key, str) or not re.fullmatch(r"movie:tmdb:[1-9][0-9]*", expected_key)
+            or not isinstance(expected_key, str) or not re.fullmatch(rf"{media_type}:tmdb:[1-9][0-9]*", expected_key)
             or type(expected_generation) is not int or expected_generation < 1
             or type(expected_old_rating) is not int or not 1 <= expected_old_rating <= 10
             or type(expected_revision) is not int or expected_revision < 1
@@ -135,20 +138,20 @@ def apply_removal_event(store: InboundStore, targets: Iterable[str], *, event_id
     replayed = False
     with store.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        event = _event(conn, event_id, expected_key, expected_generation, expected_old_rating, expected_revision)
+        event = _event(conn, event_id, expected_key, expected_generation, expected_old_rating, expected_revision, media_type)
         if automation_guard is not None:
             automation_guard(conn)
         if event["status"] == "applied":
             return {"event_id": event_id, "content_key": expected_key, "revision": event["canonical_revision"],
                     "removed": True, "queued_targets": [], "skipped_targets": ["trakt"],
                     "already_applied": True, "direct_provider_writes": 0}
-        _absence(conn, event)
+        _absence(conn, event, media_type)
         canonical, jobs = store._context(conn, expected_key)
         if canonical is not None and canonical["source"] == f"trakt-inbound:{event_id}":
-            canonical = _verify_committed(conn, event, expected_revision)
+            canonical = _verify_committed(conn, event, expected_revision, media_type)
             revision, queued, replayed = canonical["revision"], [], True
         else:
-            if (canonical is None or canonical["media_type"] != "movie"
+            if (canonical is None or canonical["media_type"] != media_type
                     or canonical["tmdb_id"] != int(expected_key.rsplit(":", 1)[1])
                     or canonical["rating"] != expected_old_rating or canonical["deleted"] != 0
                     or canonical["revision"] != expected_revision or canonical["source"] != expected_source
@@ -163,7 +166,7 @@ def apply_removal_event(store: InboundStore, targets: Iterable[str], *, event_id
             revision, queued = result["revision"], result["queued_targets"]
             if not result["removed"] or revision != expected_revision + 1 or tuple(queued) != TARGETS:
                 raise InboundError("Removal did not produce exactly one revision and three jobs")
-            _verify_committed(conn, event, expected_revision)
+            _verify_committed(conn, event, expected_revision, media_type)
     marked = _mark_applied(store, event_id=event_id, key=expected_key, generation=expected_generation,
                            old_rating=expected_old_rating, expected_revision=expected_revision,
                            fingerprint=event["fingerprint"])
