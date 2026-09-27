@@ -234,8 +234,8 @@ def test_public_show_scheduling_refuses_before_settings_http_or_database(tmp_pat
     assert not db.exists() and not db.with_name('trakt-inbound.lock').exists()
 
 
-@pytest.mark.parametrize('media_types',['show','movie,show'])
+@pytest.mark.parametrize('media_types',['show','show,movie'])
 def test_production_settings_still_reject_show_scope(monkeypatch,media_types):
     from hub.inbound.trakt import InboundSettings
     monkeypatch.setenv('TRAKT_INBOUND_MEDIA_TYPES',media_types)
-    with pytest.raises(InboundError,match='movie-only'):InboundSettings.from_env()
+    with pytest.raises(InboundError,match='movie or movie,show'):InboundSettings.from_env()

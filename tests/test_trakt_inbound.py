@@ -393,7 +393,7 @@ def test_inbound_settings_safe_defaults(monkeypatch):
     assert InboundSettings.from_env() == InboundSettings(False, ("movie",), 300)
 
 
-@pytest.mark.parametrize("media", ["show", "episode", "movie,show", ""])
+@pytest.mark.parametrize("media", ["show", "episode", "show,movie", ""])
 def test_runtime_rejects_nonmovie_configuration(monkeypatch, media):
     monkeypatch.setenv("TRAKT_INBOUND_MEDIA_TYPES", media)
     with pytest.raises(InboundError):

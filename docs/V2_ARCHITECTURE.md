@@ -443,8 +443,8 @@ remains `movie`. Movie and show calls share the same `trakt-inbound.lock` inode
 through fetch, publication and application.
 
 Recurring production configuration remains **MOVIE ONLY**:
-`TRAKT_INBOUND_MEDIA_TYPES=movie`. The environment parser still refuses `show`
-and `movie,show`; public `--scheduled-observe --media-type show` and show
+`TRAKT_INBOUND_MEDIA_TYPES=movie`. The environment parser accepts only `movie` or `movie,show` in that order;
+standalone `show` is refused. Public `--scheduled-observe --media-type show` and show
 reclassification remain refused. No show timer or recurring service is installed.
 Show auto-apply is implemented and internally validated, but show production
 scheduling is not enabled. Manual show observation never invokes auto-apply.
@@ -463,3 +463,46 @@ schema objects are refused without partial migration. Canonical ratings and outb
 are never changed by migration. Scheduled commands open existing schemas without
 initialization; deployment performs the migration explicitly while the timer is
 stopped and after a mode-0600 SQLite API backup.
+
+
+### Phase 6L: one scheduler invocation for movie and show
+
+The environment-driven `--scheduled-observe` command now supports only
+`TRAKT_INBOUND_MEDIA_TYPES=movie` (also the absent-variable default) or
+`movie,show`. Duplicate, reversed, empty-token, unknown and episode/season
+selections fail closed; tokens are trimmed without reordering. Explicit
+`--scheduled-observe --media-type show` and show reclassification remain refused.
+The environment is the sole authority for scheduled media selection.
+
+One existing five-minute timer and oneshot service remain unchanged.
+`scheduled_observe_many()` owns the existing `trakt-inbound.lock` across the
+entire invocation: movie fetch/validation/publication/auto-apply, then show
+fetch/validation/publication/auto-apply. Execution is sequential, without
+subprocess fan-out or a second lock. Both it and the compatible single-media
+`scheduled_observe()` use the same internal single-media helper, authoritative
+`observe()` and `auto_apply()`, and guarded upsert/removal importers. Snapshot
+media must match the selected store before publication. Overlap skips both
+media before any read or mutation and reports zero mutation/provider-write counts.
+
+Each medium retains independent generation, hash, snapshot/unmapped/event rows,
+and its own maximum-candidate limit, with shared targets and echo-grace settings.
+For example, eight movie and eight show candidates each satisfy a limit of ten;
+more than ten in either medium fails that medium before application. With
+auto-apply off, both media may publish observed candidates but no canonical or
+outbox writes occur. Trakt-origin imports exclude Trakt from worker delivery.
+
+Failure stops the invocation: a movie failure never starts show; a later show
+failure preserves proven movie commits. Atomic publication and guarded import
+rules still govern each medium. A show auto-apply failure retains the published
+show generation/event and prior proven imports, leaving remaining candidates
+for audit. No cross-media transaction rolls back already committed work.
+Dual-media failures report sanitized media counters available so far and the
+failed medium, with exit failure. Dual success reports `movie_`/`show_` counters
+and summed `canonical_mutations`/`provider_writes` (the latter remains zero).
+Movie-only results, failures and top-level journal counters remain compatible.
+
+Production remains **movie-only until Phase 6M**. Phase 6L validates exactly one
+controlled deployed dual-media no-op using an invocation-only environment
+override; it does not edit the permanent environment or enable recurring show
+polling. The final genuine movie-only timer activation must leave show state,
+including successful-poll metadata, untouched.

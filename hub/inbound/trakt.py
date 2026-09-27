@@ -1,4 +1,4 @@
-"""Movie production sync and manual show observation/guarded upsert import."""
+"""Environment-selected scheduled sync and guarded manual Trakt operations."""
 from __future__ import annotations
 
 import argparse
@@ -32,8 +32,8 @@ class InboundSettings:
             interval = int(os.getenv("TRAKT_INBOUND_POLL_SECONDS", "300"))
         except ValueError:
             raise InboundError("Trakt inbound polling interval was invalid") from None
-        if enabled not in {"false", "true"} or media != ("movie",) or interval < 1:
-            raise InboundError("Trakt inbound settings must remain movie-only with a valid interval")
+        if enabled not in {"false", "true"} or media not in (("movie",), ("movie", "show")) or interval < 1:
+            raise InboundError("Trakt inbound settings require movie or movie,show with a valid interval")
         auto = os.getenv("TRAKT_INBOUND_AUTO_APPLY", "false").strip().lower()
         limit = os.getenv("TRAKT_INBOUND_AUTO_APPLY_MAX_EVENTS", "10").strip()
         grace = os.getenv("TRAKT_INBOUND_ECHO_GRACE_SECONDS", "600").strip()
@@ -123,6 +123,31 @@ def observe(store: InboundStore, read: Callable[[], Snapshot], *,
                          baseline=baseline, reset=reset)
 
 
+SCHEDULED_COUNTERS = (
+    "generation", "snapshot_changed", "added", "changed", "removed", "deferred",
+    "auto_apply_enabled", "auto_candidates", "auto_applied", "auto_grace_deferred",
+    "auto_failed", "canonical_mutations", "provider_writes",
+)
+
+
+def _print_scheduled_result(result: dict) -> None:
+    def print_counters(values: dict, prefix: str = "") -> None:
+        for key in SCHEDULED_COUNTERS:
+            if key in values:
+                value = values[key]
+                print(f"{prefix}{key}={str(value).lower() if type(value) is bool else value}")
+    if "media_results" not in result:
+        print_counters(result)
+        return
+    for media in ("movie", "show"):
+        if media in result["media_results"]:
+            print_counters(result["media_results"][media], media + "_")
+    for key in ("canonical_mutations", "provider_writes"):
+        print(f"{key}={result[key]}")
+    if "failed_media" in result:
+        print(f"failed_media={result['failed_media']}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Manual Trakt observation or explicitly confirmed single-event operations")
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -196,12 +221,13 @@ def main(argv: list[str] | None = None) -> int:
         from hub.settings import HubSettings
         settings = HubSettings.from_env()
         if args.scheduled_observe:
-            from hub.inbound.scheduled import scheduled_observe
-            def read_scheduled() -> Snapshot:
+            from hub.inbound.scheduled import scheduled_observe_many
+            def read_scheduled(media: str) -> Snapshot:
                 with httpx.Client(timeout=10.0, follow_redirects=False) as client:
-                    return fetch_snapshot(get_provider("trakt"), client)
-            result = scheduled_observe(
+                    return fetch_snapshot(get_provider("trakt"), client, media_type=media)
+            result = scheduled_observe_many(
                 settings.db_path, read_scheduled, enabled=inbound_settings.enabled,
+                media_types=inbound_settings.media_types,
                 auto_apply_enabled=inbound_settings.auto_apply,
                 max_events=inbound_settings.auto_apply_max_events,
                 echo_grace_seconds=inbound_settings.echo_grace_seconds, targets=settings.targets,
@@ -210,11 +236,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("Trakt scheduled observation skipped: another instance is active")
             else:
                 print("Trakt scheduled observation complete")
-                for key in ("generation", "snapshot_changed", "added", "changed", "removed", "deferred",
-                            "auto_apply_enabled", "auto_candidates", "auto_applied", "auto_grace_deferred",
-                            "auto_failed", "canonical_mutations", "provider_writes"):
-                    value = result[key]
-                    print(f"{key}={str(value).lower() if type(value) is bool else value}")
+                _print_scheduled_result(result)
             if result["skipped_overlap"]:
                 print("canonical_mutations=0")
                 print("provider_writes=0")
@@ -282,13 +304,10 @@ def main(argv: list[str] | None = None) -> int:
     except InboundError as exc:
         # Only fixed local messages and sanitized counters reach operator output.
         if args.scheduled_observe and hasattr(exc, "result"):
-            print("Trakt automatic application failed; remaining candidates retained")
-            for key in ("generation", "snapshot_changed", "added", "changed", "removed", "deferred",
-                        "auto_apply_enabled", "auto_candidates", "auto_applied", "auto_grace_deferred",
-                        "auto_failed", "canonical_mutations", "provider_writes"):
-                if key in exc.result:
-                    value = exc.result[key]
-                    print(f"{key}={str(value).lower() if type(value) is bool else value}")
+            print("Trakt scheduled media processing failed; completed work retained"
+                  if "media_results" in exc.result else
+                  "Trakt automatic application failed; remaining candidates retained")
+            _print_scheduled_result(exc.result)
             return 1
         print("Trakt scheduled observation failed; trusted state retained" if args.scheduled_observe
               else str(exc))
