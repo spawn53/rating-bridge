@@ -8,7 +8,7 @@ from pathlib import Path
 import stat
 from typing import Callable, Iterator
 
-from hub.inbound.models import InboundError, Snapshot
+from hub.inbound.models import InboundError, Snapshot, validate_media_type
 from hub.inbound.storage import InboundStore
 
 
@@ -36,13 +36,15 @@ def scheduled_lock(db_path: str) -> Iterator[bool]:
 def scheduled_observe(db_path: str, read: Callable[[], Snapshot], *, enabled: bool,
                       auto_apply_enabled: bool = False, max_events: int = 10,
                       echo_grace_seconds: int = 600,
+                      media_type: str = "movie",
                       targets: tuple[str, ...] = ("tmdb", "trakt", "simkl", "mdblist")) -> dict:
+    media_type = validate_media_type(media_type)
     if enabled is not True:
         raise InboundError("Scheduled observation requires inbound enabled")
     with scheduled_lock(db_path) as acquired:
         if not acquired:
             return {"skipped_overlap": True, "canonical_mutations": 0, "provider_writes": 0}
-        store = InboundStore(db_path, initialize=False)
+        store = InboundStore(db_path, initialize=False, media_type=media_type)
         # Existing observe enforces a trusted baseline and atomic generation CAS.
         from hub.inbound.trakt import observe
         result = observe(store, read)

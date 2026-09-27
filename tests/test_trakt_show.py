@@ -305,7 +305,7 @@ def test_show_candidate_removal_retains_active_canonical(store):
     assert canonical_dump(store)==before
 
 
-def test_show_manual_imports_require_events_and_automation_remains_refused(store):
+def test_show_manual_imports_require_events_and_auto_apply_requires_baseline(store):
     before=canonical_dump(store)
     with pytest.raises(InboundError,match='not found'):apply_event(store,GLOBAL_TARGETS,event_id=1,expected_key='show:tmdb:123',expected_rating=8,expected_generation=1,expected_revision=0,confirmed=True)
     with pytest.raises(InboundError,match='not found'):apply_removal_event(store,GLOBAL_TARGETS,event_id=1,expected_key='show:tmdb:123',expected_generation=1,expected_old_rating=9,expected_revision=1,expected_source='nuvio',confirmed=True)

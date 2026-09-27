@@ -426,11 +426,28 @@ exactly three removal jobs (TMDb, Simkl and MDBList), excludes Trakt, and retain
 identity and the original provider rating timestamp. The new canonical update
 timestamp and event application timestamp record the import; detection time is
 unchanged. Repeating an applied event is idempotent, and recovery of an interrupted
-audit requires the exact committed tombstone and payloads. Show reclassification,
-auto-apply and scheduled polling remain disabled and fail closed.
+audit requires the exact committed tombstone and payloads. Show reclassification
+and recurring production polling remain disabled and fail closed.
 Episode/season inbound observation is unsupported. Existing show ratings captured
 by the baseline are historical source state: they create no events, canonical
 ratings or outbox jobs and are never automatically backfilled.
+
+Phase 6H implements and tests the shared automatic-application engine for movies
+and shows internally. It derives media from `store.media_type`, selects only
+current-generation observed candidates for that media, validates canonical
+transitions and delegates writes to the existing guarded upsert/removal importers.
+Both media retain source exclusion, echo grace, candidate limits, ordered failure
+handling and exact audit-gap recovery. Internal `scheduled_observe(...,
+media_type="show")` supports an explicitly controlled one-shot call; its default
+remains `movie`. Movie and show calls share the same `trakt-inbound.lock` inode
+through fetch, publication and application.
+
+Recurring production configuration remains **MOVIE ONLY**:
+`TRAKT_INBOUND_MEDIA_TYPES=movie`. The environment parser still refuses `show`
+and `movie,show`; public `--scheduled-observe --media-type show` and show
+reclassification remain refused. No show timer or recurring service is installed.
+Show auto-apply is implemented and internally validated, but show production
+scheduling is not enabled. Manual show observation never invokes auto-apply.
 
 Show identities use `show:tmdb:<id>`; movie identities retain `movie:tmdb:<id>`.
 Snapshots cannot mix media. Each medium has independent state, hash, generation,

@@ -4,11 +4,12 @@ from __future__ import annotations
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 import sqlite3
+import re
 from typing import Iterable
 
 from hub.inbound.classification import classify
 from hub.inbound.importer import apply_event, GLOBAL_TARGETS
-from hub.inbound.models import InboundError, timestamp
+from hub.inbound.models import InboundError, timestamp, validate_media_type
 from hub.inbound.removal import apply_removal_event
 from hub.inbound.storage import InboundStore
 
@@ -39,16 +40,29 @@ def _utc(value: object) -> datetime:
 
 def _plan(store: InboundStore, event: dict, generation: int, grace: int,
           now: datetime, *, connection: sqlite3.Connection | None = None) -> tuple[dict, bool]:
+    media_type = validate_media_type(store.media_type)
     with (store.connect() if connection is None else nullcontext(connection)) as conn:
         if connection is None:
             conn.execute("BEGIN IMMEDIATE")
         elif not conn.in_transaction:
             raise InboundError("Automatic import guard requires an active transaction")
-        state = conn.execute("SELECT generation FROM inbound_state WHERE provider='trakt' AND media_type='movie'").fetchone()
-        row = conn.execute("SELECT * FROM inbound_events WHERE id=?", (event["id"],)).fetchone()
+        state = conn.execute("SELECT generation FROM inbound_state WHERE provider='trakt' AND media_type=?",
+                             (media_type,)).fetchone()
+        row = conn.execute("""
+            SELECT * FROM inbound_events WHERE id=? AND provider='trakt' AND media_type=?
+            AND generation=? AND status='observed' AND classification='candidate'
+            AND reason='different_provider_state' AND future_action IN ('upsert','delete')
+        """, (event["id"], media_type, generation)).fetchone()
         if state is None or state[0] != generation or row is None or dict(row) != event:
             raise InboundError("Automatic candidate context changed")
+        if (not isinstance(event["content_key"], str)
+                or not re.fullmatch(rf"{media_type}:tmdb:[1-9][0-9]*", event["content_key"])):
+            raise InboundError("Automatic candidate media identity is invalid")
         canonical, jobs = store._context(conn, event["content_key"])
+        if canonical is not None and (canonical["media_type"] != media_type
+                or canonical["content_key"] != event["content_key"]
+                or canonical["tmdb_id"] != int(event["content_key"].rsplit(":", 1)[1])):
+            raise InboundError("Automatic candidate canonical media identity is invalid")
         revision = canonical["revision"] if canonical else 0
         if type(revision) is not int or revision < (1 if canonical else 0):
             raise InboundError("Automatic candidate canonical revision is invalid")
@@ -97,8 +111,7 @@ def auto_apply(store: InboundStore, targets: Iterable[str], *, generation: int,
                now: datetime | None = None) -> dict:
     result = counters(True)
     try:
-        if store.media_type != "movie":
-            raise InboundError("Show inbound observation is observe-only; automatic application refused")
+        media_type = validate_media_type(store.media_type)
         targets = tuple(targets)
         if (targets != GLOBAL_TARGETS or type(max_events) is not int or not 1 <= max_events <= 100
                 or type(echo_grace_seconds) is not int or not 0 <= echo_grace_seconds <= 86400
@@ -109,15 +122,16 @@ def auto_apply(store: InboundStore, targets: Iterable[str], *, generation: int,
         if now.utcoffset() != timedelta(0):
             raise InboundError("Automatic application clock requires UTC")
         with store.connect() as conn:
-            state = conn.execute("SELECT generation FROM inbound_state WHERE provider='trakt' AND media_type='movie'").fetchone()
+            state = conn.execute("SELECT generation FROM inbound_state WHERE provider='trakt' AND media_type=?",
+                                 (media_type,)).fetchone()
             if state is None or state[0] != generation:
                 raise InboundError("Automatic generation is no longer current")
             events = [dict(row) for row in conn.execute("""
-                SELECT * FROM inbound_events WHERE provider='trakt' AND media_type='movie'
+                SELECT * FROM inbound_events WHERE provider='trakt' AND media_type=?
                 AND generation=? AND status='observed' AND classification='candidate'
                 AND reason='different_provider_state' AND future_action IN ('upsert','delete')
                 ORDER BY id
-            """, (generation,))]
+            """, (media_type, generation))]
         result["auto_candidates"] = len(events)
         if len(events) > max_events:
             raise InboundError("Automatic candidate limit exceeded")
