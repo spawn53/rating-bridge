@@ -25,11 +25,12 @@ class RatingStore:
     so a provider outage can never lose the user's rating.
     """
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, initialize: bool = True):
         self.path = path
         if path != ":memory:":
             Path(path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
+        if initialize:
+            self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30)

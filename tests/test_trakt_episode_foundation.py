@@ -312,9 +312,11 @@ def test_add_change_remove_and_no_duplicate_events(store):
     events=dump(store.path,SCHEMAS)['inbound_episode_events']
     assert [(e['event_type'],e['old_rating'],e['new_rating']) for e in events]==[('added',None,8),('changed',8,7),('removed',7,None)]
     assert len({e['fingerprint'] for e in events})==3
+    assert [e['future_action'] for e in events]==['upsert','upsert','delete']
     for e in events:
-        assert e['content_key']==KEY and e['status']=='observed' and e['future_action'] is None
-        assert e['reason']=='episode_import_disabled' and e['media_type']=='episode'
+        assert e['content_key']==KEY and e['status']=='observed'
+        assert e['reason']=='manual_episode_import_required'
+        assert e['classification']=='candidate' and e['media_type']=='episode'
         assert json.loads(e['rating_json'])['trakt_id']==194117
     assert events[-1]['provider_rated_at']==rating().rated_at
     assert observe_episode(store,lambda:snapshot())['events']==0
@@ -451,7 +453,7 @@ def test_existing_cli_still_refuses_episode_before_io(mode,tmp_path,monkeypatch)
     assert e.value.code==2 and not (tmp_path/'must-not-create.sqlite3').exists()
 
 
-@pytest.mark.parametrize('flag',['--scheduled-observe','--apply-event','--apply-removal-event','--auto-apply','--reclassify-event','--confirm-live-import'])
+@pytest.mark.parametrize('flag',['--scheduled-observe','--apply-event','--apply-removal-event','--auto-apply','--reclassify-event'])
 def test_episode_cli_has_no_write_or_schedule_flags(flag,tmp_path):
     db=tmp_path/'must-not-create.sqlite3'
     argv=['--baseline','--db',str(db),flag]+(['1'] if 'event' in flag else [])
@@ -541,8 +543,10 @@ def test_episode_events_cannot_be_marked_applied_by_schema(store):
     observe_episode(store,lambda:snapshot(rating()))
     before=dump(store.path,SCHEMAS)
     with store.connect() as c:
-        with pytest.raises(sqlite3.IntegrityError):c.execute("UPDATE inbound_episode_events SET status='applied'")
-        with pytest.raises(sqlite3.IntegrityError):c.execute("UPDATE inbound_episode_events SET future_action='upsert'")
+        with pytest.raises(sqlite3.DatabaseError):c.execute("UPDATE inbound_episode_events SET status='applied'")
+        with pytest.raises(sqlite3.DatabaseError):c.execute("UPDATE inbound_episode_events SET future_action='upsert'")
+        with pytest.raises(sqlite3.DatabaseError):c.execute("UPDATE inbound_episode_events SET fingerprint='bad'")
+        with pytest.raises(sqlite3.DatabaseError):c.execute("DELETE FROM inbound_episode_events")
     assert dump(store.path,SCHEMAS)==before
 
 

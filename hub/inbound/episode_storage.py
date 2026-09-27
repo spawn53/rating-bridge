@@ -1,4 +1,4 @@
-"""Observation-only episode audit. Never creates canonical ratings or jobs."""
+"""Episode audit storage with an isolated manual-import write connection."""
 from __future__ import annotations
 
 from dataclasses import asdict
@@ -39,9 +39,14 @@ SCHEMAS = {
         old_rating INTEGER, new_rating INTEGER,
         provider_rated_at TEXT NOT NULL, detected_at TEXT NOT NULL,
         rating_json TEXT NOT NULL,
-        status TEXT NOT NULL CHECK(status='observed'),
-        reason TEXT NOT NULL CHECK(reason='episode_import_disabled'),
-        future_action TEXT CHECK(future_action IS NULL))""",
+        status TEXT NOT NULL CHECK(status IN ('observed','applied')),
+        reason TEXT NOT NULL CHECK(reason='manual_episode_import_required'),
+        classification TEXT NOT NULL CHECK(classification='candidate'),
+        future_action TEXT NOT NULL CHECK(future_action IN ('upsert','delete')),
+        applied_at TEXT, canonical_revision INTEGER,
+        CHECK((status='applied' AND applied_at IS NOT NULL
+            AND canonical_revision IS NOT NULL AND canonical_revision > 0)
+            OR (status='observed' AND applied_at IS NULL AND canonical_revision IS NULL)))""",
 }
 
 
@@ -89,6 +94,9 @@ class EpisodeStore:
             if action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE):
                 if table not in SCHEMAS and table not in ("sqlite_master", "sqlite_schema"):
                     return sqlite3.SQLITE_DENY
+                if (table == "inbound_episode_events"
+                        and action in (sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE)):
+                    return sqlite3.SQLITE_DENY
             if action == sqlite3.SQLITE_CREATE_TABLE and table not in (*SCHEMAS, "sqlite_sequence"):
                 return sqlite3.SQLITE_DENY
             if action in (sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH,
@@ -96,6 +104,32 @@ class EpisodeStore:
                           sqlite3.SQLITE_CREATE_TRIGGER, sqlite3.SQLITE_DROP_TRIGGER):
                 return sqlite3.SQLITE_DENY
             return sqlite3.SQLITE_OK
+        conn.set_authorizer(authorize)
+        return conn
+
+    def connect_for_import(self) -> sqlite3.Connection:
+        """Open the narrow write surface used only by the manual E3 importer."""
+        conn = sqlite3.connect(Path(self.path).as_uri() + "?mode=rw", uri=True, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=30000")
+        writable = {"ratings", "outbox", "sqlite_sequence"}
+        event_audit = {"status", "applied_at", "canonical_revision"}
+
+        def authorize(action, table, column, database, source):
+            if action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE):
+                if table == "inbound_episode_events":
+                    if action != sqlite3.SQLITE_UPDATE or column not in event_audit:
+                        return sqlite3.SQLITE_DENY
+                elif table not in writable:
+                    return sqlite3.SQLITE_DENY
+            if action in (sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH,
+                          sqlite3.SQLITE_ALTER_TABLE, sqlite3.SQLITE_DROP_TABLE,
+                          sqlite3.SQLITE_CREATE_TABLE, sqlite3.SQLITE_CREATE_TRIGGER,
+                          sqlite3.SQLITE_DROP_TRIGGER):
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
         conn.set_authorizer(authorize)
         return conn
 
@@ -171,17 +205,18 @@ class EpisodeStore:
                         fingerprint = hashlib.sha256(json.dumps(
                             ["trakt", "episode", version, key, kind, a, b, snapshot.snapshot_hash],
                             separators=(",", ":")).encode()).hexdigest()
+                        action = "delete" if kind == "removed" else "upsert"
                         fields = asdict(new) if new else {k: old[k] for k in (
                             "rating", "rated_at", "tmdb_series_id", "season_number", "episode_number",
                             "trakt_id", "imdb_id", "tmdb_id")}
                         conn.execute("""INSERT INTO inbound_episode_events
                             (fingerprint,provider,media_type,content_key,generation,event_type,
                              old_rating,new_rating,provider_rated_at,detected_at,rating_json,
-                             status,reason,future_action)
+                             status,reason,classification,future_action,applied_at,canonical_revision)
                             VALUES (?,'trakt','episode',?,?,?,?,?,?,?,?,'observed',
-                                    'episode_import_disabled',NULL)""",
+                                    'manual_episode_import_required','candidate',?,NULL,NULL)""",
                             (fingerprint, key, version, kind, a, b, fields["rated_at"], now,
-                             json.dumps(fields, sort_keys=True, separators=(",", ":"))))
+                             json.dumps(fields, sort_keys=True, separators=(",", ":")), action))
                 conn.execute("DELETE FROM inbound_episode_snapshots")
                 conn.executemany("INSERT INTO inbound_episode_snapshots VALUES (?,?,?,?,?,?,?,?,?,?)",
                                  [(r.content_key, r.rating, r.rated_at, r.tmdb_series_id,

@@ -507,7 +507,7 @@ override; it does not edit the permanent environment or enable recurring show
 polling. The final genuine movie-only timer activation must leave show state,
 including successful-poll metadata, untouched.
 
-## Episode rating observer foundation (repository only)
+## Episode rating foundation and guarded manual import (repository only)
 
 The manual episode observer is separate from the movie/show production command:
 
@@ -519,8 +519,8 @@ python -m hub.inbound.episodes --once --observe-only --db /path/to/episode-audit
 The audit database must be selected explicitly; this command has no default
 production database. `--baseline --reset` explicitly replaces the trusted episode
 snapshot, advances its generation and retains event history. There is no scheduled,
-import, removal-import, reclassification or auto-apply mode. Production settings,
-units, images and provider credentials are outside this foundation change.
+reclassification or auto-apply mode. Production settings, units, images and provider
+credentials are outside this repository-only change.
 
 The observer makes only authenticated GET requests to
 `/users/me/ratings/episodes`, as described in the
@@ -551,8 +551,9 @@ unknown or partial schemas and attached triggers/indexes are refused. There is
 no migration or widening of the existing movie/show tables or constraints.
 Episode generations and deterministic hashes include only episode data. A
 baseline creates no events; identical polls update only successful-poll time.
-Added, changed and removed scores create observation-only audit events with
-`status=observed`, `reason=episode_import_disabled` and `future_action=NULL`.
+Added, changed and removed scores create manual-import candidates with
+`status=observed`, `reason=manual_episode_import_required`,
+`classification=candidate` and an explicit `future_action` of `upsert` or `delete`.
 Removal audit retains the previous episode metadata and rating timestamp.
 Metadata-only changes advance the snapshot generation without inventing score
 changes. Trusted snapshot hashes, identities and row counts are checked before polling
@@ -560,15 +561,46 @@ publication. Generation compare-and-swap and one SQLite transaction prevent part
 publication; resets retain historical event fingerprints.
 
 Observation writes only these audit tables. The observer connection's SQLite
-authorizer denies writes to canonical ratings, outbox, existing movie/show tables
-and explicit sequence edits. Episode events cannot be marked applied and cannot
-carry a write action. Existing movie/show importers and scheduler still reject
-`episode`; recurring media selection remains limited to `movie` or `movie,show`.
-The manual episode module ignores inbound auto-apply environment settings and
-never invokes an importer, outbox worker or provider delivery method. Existing
-trusted canonical API capabilities are unchanged; this phase adds no inbound
-path into them.
+authorizer denies writes to canonical ratings, outbox, existing movie/show tables,
+event application audit fields and explicit sequence edits.
 
-No deployment or production runtime change is part of this foundation. Tests use
-mock HTTP transports and local temporary databases, with the existing automatic
-network-denial fixture. All existing movie/show code and tests remain unchanged.
+E3 adds two explicit manual commands. Every mutable expectation is supplied on
+the command line; removal additionally binds the old rating and current canonical
+source:
+
+```sh
+python -m hub.inbound.episodes --apply-event EVENT_ID --db /path/to/hub.sqlite3 \
+  --expect-content-key episode:tmdb:SERIES:sSEASON:eEPISODE \
+  --expect-rating RATING --expect-generation GENERATION \
+  --expect-canonical-revision REVISION --confirm-live-import
+
+python -m hub.inbound.episodes --apply-removal-event EVENT_ID --db /path/to/hub.sqlite3 \
+  --expect-content-key episode:tmdb:SERIES:sSEASON:eEPISODE \
+  --expect-old-rating RATING --expect-generation GENERATION \
+  --expect-canonical-revision REVISION --expect-canonical-source SOURCE \
+  --confirm-live-import
+```
+
+The target contract is a constant, ordered `("trakt", "tmdb")` source plan that
+derives exactly one downstream target, `("tmdb",)`. Empty, reordered, duplicated,
+expanded and global target plans fail closed. The importer does not consult the
+global capability table and never queues Trakt, IMDb, Simkl, MDBList or Letterboxd.
+
+The import connection starts `BEGIN IMMEDIATE` before it re-reads the event,
+trusted snapshot generation, newer-event state, classification/action and canonical
+identity. Canonical upsert or tombstone plus its single TMDb outbox row commits in
+one transaction. The event is marked applied in a later audited transaction. A
+restart across that boundary accepts only the exact provenance, revision, identity,
+rating/tombstone, retained `rated_at`, and one matching TMDb payload; it never
+replays the canonical mutation or job. Missing, extra or corrupted audit state is
+refused.
+
+The importer performs no provider lookup or HTTP call. Existing movie/show
+importers and scheduler still reject `episode`; recurring media selection remains
+limited to `movie` or `movie,show`. The manual episode module ignores inbound
+auto-apply environment settings and never invokes an outbox worker or provider
+delivery method.
+
+No deployment or production runtime change is part of E3. Tests use mock HTTP
+transports and local temporary databases, with the existing automatic network-denial
+fixture. Existing movie/show target behavior remains unchanged.

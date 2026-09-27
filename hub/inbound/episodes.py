@@ -1,4 +1,4 @@
-"""Explicit manual episode baseline/observation; no import or scheduling route."""
+"""Explicit manual episode observation and guarded import; no scheduling route."""
 from __future__ import annotations
 
 import argparse
@@ -89,23 +89,89 @@ def observe_episode(store: EpisodeStore, read: Callable[[], EpisodeSnapshot], *,
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Manual Trakt episode observation only")
+    parser = argparse.ArgumentParser(
+        description="Manual Trakt episode observation and guarded import"
+    )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--baseline", action="store_true")
     mode.add_argument("--once", action="store_true")
+    mode.add_argument("--apply-event", type=int)
+    mode.add_argument("--apply-removal-event", type=int)
     # No default production DB or automatic configuration. The operator must
     # select an audit DB explicitly. Unsupported write/scheduler flags fail here.
     parser.add_argument("--db", required=True)
     parser.add_argument("--observe-only", action="store_true")
     parser.add_argument("--reset", action="store_true")
+    parser.add_argument("--expect-content-key")
+    parser.add_argument("--expect-rating", type=int)
+    parser.add_argument("--expect-old-rating", type=int)
+    parser.add_argument("--expect-generation", type=int)
+    parser.add_argument("--expect-canonical-revision", type=int)
+    parser.add_argument("--expect-canonical-source")
+    parser.add_argument("--confirm-live-import", action="store_true")
     args = parser.parse_args(argv)
-    if (args.once and (not args.observe_only or args.reset)
-            or args.baseline and args.observe_only or args.reset and not args.baseline):
+    applying = args.apply_event is not None
+    removing = args.apply_removal_event is not None
+    guards = (args.expect_content_key, args.expect_rating, args.expect_old_rating,
+              args.expect_generation, args.expect_canonical_revision,
+              args.expect_canonical_source)
+    if applying:
+        required = (args.expect_content_key, args.expect_rating,
+                    args.expect_generation, args.expect_canonical_revision)
+        invalid = (not args.confirm_live_import or any(value is None for value in required)
+                   or args.expect_old_rating is not None
+                   or args.expect_canonical_source is not None
+                   or args.observe_only or args.reset)
+    elif removing:
+        required = (args.expect_content_key, args.expect_old_rating, args.expect_generation,
+                    args.expect_canonical_revision, args.expect_canonical_source)
+        invalid = (not args.confirm_live_import or any(value is None for value in required)
+                   or args.expect_rating is not None or args.observe_only or args.reset)
+    else:
+        invalid = (any(value is not None for value in guards) or args.confirm_live_import
+                   or args.once and (not args.observe_only or args.reset)
+                   or args.baseline and args.observe_only or args.reset and not args.baseline)
+    if invalid:
         print("Episode observer refused: use --baseline [--reset] or --once --observe-only")
         return 2
     try:
+        store = EpisodeStore(args.db, initialize=not (applying or removing))
+        if applying:
+            from hub.inbound.episode_importer import (
+                EPISODE_SOURCE_TARGETS, apply_episode_event,
+            )
+            result = apply_episode_event(
+                store, EPISODE_SOURCE_TARGETS, event_id=args.apply_event,
+                expected_key=args.expect_content_key, expected_rating=args.expect_rating,
+                expected_generation=args.expect_generation,
+                expected_revision=args.expect_canonical_revision,
+                confirmed=args.confirm_live_import,
+            )
+            print("Trakt episode single-event import complete")
+            for key in ("event_id", "content_key", "rating", "revision", "queued_targets",
+                        "skipped_targets", "already_applied", "direct_provider_writes"):
+                print(f"{key}={result[key]}")
+            return 0
+        if removing:
+            from hub.inbound.episode_importer import (
+                EPISODE_SOURCE_TARGETS, apply_episode_removal,
+            )
+            result = apply_episode_removal(
+                store, EPISODE_SOURCE_TARGETS, event_id=args.apply_removal_event,
+                expected_key=args.expect_content_key,
+                expected_old_rating=args.expect_old_rating,
+                expected_generation=args.expect_generation,
+                expected_revision=args.expect_canonical_revision,
+                expected_source=args.expect_canonical_source,
+                confirmed=args.confirm_live_import,
+            )
+            print("Trakt episode single-event removal import complete")
+            for key in ("event_id", "content_key", "revision", "removed",
+                        "queued_targets", "skipped_targets", "already_applied",
+                        "direct_provider_writes"):
+                print(f"{key}={result[key]}")
+            return 0
         from hub.providers.registry import get_provider
-        store = EpisodeStore(args.db)
         with httpx.Client(timeout=10, follow_redirects=False) as client:
             result = observe_episode(store, lambda: fetch_episode_snapshot(get_provider("trakt"), client),
                                      baseline=args.baseline, reset=args.reset)
@@ -117,7 +183,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{key}={str(value).lower() if type(value) is bool else value}")
         return 0
     except Exception:
-        print("Trakt episode observation failed; no canonical/outbox/provider writes authorized")
+        if applying or removing:
+            print("Trakt episode manual import failed; audit database state before retry; "
+                  "no provider writes attempted")
+        else:
+            print("Trakt episode observation failed; no canonical/outbox/provider writes authorized")
         return 1
 
 
