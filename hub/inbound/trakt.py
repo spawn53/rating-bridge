@@ -1,0 +1,329 @@
+"""Environment-selected scheduled sync and guarded manual Trakt operations."""
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import math
+import os
+import re
+import time
+from typing import Callable
+
+import httpx
+
+from hub.inbound.models import InboundError, Snapshot, normalize, validate_media_type
+from hub.inbound.storage import InboundStore
+
+
+@dataclass(frozen=True)
+class InboundSettings:
+    enabled: bool = False
+    media_types: tuple[str, ...] = ("movie",)
+    poll_seconds: int = 300
+    auto_apply: bool = False
+    auto_apply_max_events: int = 10
+    echo_grace_seconds: int = 600
+
+    @classmethod
+    def from_env(cls) -> "InboundSettings":
+        enabled = os.getenv("TRAKT_INBOUND_ENABLED", "false").strip().lower()
+        media = tuple(x.strip() for x in os.getenv("TRAKT_INBOUND_MEDIA_TYPES", "movie").split(","))
+        try:
+            interval = int(os.getenv("TRAKT_INBOUND_POLL_SECONDS", "300"))
+        except ValueError:
+            raise InboundError("Trakt inbound polling interval was invalid") from None
+        if enabled not in {"false", "true"} or media not in (("movie",), ("movie", "show")) or interval < 1:
+            raise InboundError("Trakt inbound settings require movie or movie,show with a valid interval")
+        auto = os.getenv("TRAKT_INBOUND_AUTO_APPLY", "false").strip().lower()
+        limit = os.getenv("TRAKT_INBOUND_AUTO_APPLY_MAX_EVENTS", "10").strip()
+        grace = os.getenv("TRAKT_INBOUND_ECHO_GRACE_SECONDS", "600").strip()
+        if (auto not in {"false", "true"} or not re.fullmatch(r"[0-9]{1,3}", limit)
+                or not 1 <= int(limit) <= 100 or not re.fullmatch(r"[0-9]{1,5}", grace)
+                or not 0 <= int(grace) <= 86400):
+            raise InboundError("Trakt automatic application settings were invalid")
+        return cls(enabled == "true", media, interval, auto == "true", int(limit), int(grace))
+
+
+def fetch_snapshot(provider: object, client: httpx.Client, timeout: float = 60,
+                   *, clock: Callable[[], float] | None = None, media_type: str = "movie") -> Snapshot:
+    validate_media_type(media_type)
+    clock = clock or time.monotonic
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise InboundError("Trakt snapshot deadline was invalid")
+    deadline = clock() + timeout
+    eligible, unmapped = [], []
+    page_number = 1
+    totals = None
+    observed = 0
+    while True:
+        try:
+            headers = provider.headers  # Existing OAuth supplier/refresh lifecycle.
+            remaining = deadline - clock()
+            if remaining <= 0:
+                raise InboundError("Trakt snapshot deadline exhausted")
+            response = client.get(
+                f"https://api.trakt.tv/users/me/ratings/{media_type}s",
+                headers=headers, params={"page": str(page_number), "limit": "250"},
+                timeout=min(10.0, remaining),
+            )
+            if clock() > deadline:
+                raise InboundError("Trakt snapshot deadline exhausted")
+            if not response.is_success:
+                raise InboundError("Trakt snapshot read failed")
+            items = response.json()
+            values = []
+            for name in ("Page", "Page-Count", "Limit", "Item-Count"):
+                raw = response.headers.get("X-Pagination-" + name)
+                if not isinstance(raw, str) or not re.fullmatch(r"[0-9]+", raw):
+                    raise InboundError("Trakt snapshot pagination headers were invalid")
+                values.append(int(raw))
+            page, pages, limit, count = values
+            if (not isinstance(items, list) or page != page_number
+                    or not 0 <= pages <= 1000 or not 1 <= limit <= 250
+                    or len(items) > limit
+                    or (pages == 0 and (page != 1 or items or count != 0))
+                    or (pages > 0 and not 1 <= page <= pages)):
+                raise InboundError("Trakt snapshot pagination was inconsistent")
+            current_totals = (pages, limit, count)
+            if totals is not None and current_totals != totals:
+                raise InboundError("Trakt snapshot pagination changed during read")
+            totals = current_totals
+            for item in items:
+                rating = normalize(item, media_type=media_type)
+                (eligible if rating.tmdb_id is not None else unmapped).append(rating)
+            observed += len(items)
+            if observed > count:
+                raise InboundError("Trakt snapshot item count was inconsistent")
+            if pages == 0 or page >= pages:
+                if observed != count:
+                    raise InboundError("Trakt snapshot item count was inconsistent")
+                snapshot = Snapshot(tuple(eligible), tuple(unmapped), media_type=media_type)
+                if clock() > deadline:
+                    raise InboundError("Trakt snapshot deadline exhausted")
+                return snapshot
+            page_number += 1
+        except InboundError:
+            raise
+        except Exception:
+            # HTTP errors can contain credential-bearing URLs and raw responses.
+            raise InboundError("Trakt snapshot could not be verified") from None
+
+
+def observe(store: InboundStore, read: Callable[[], Snapshot], *,
+            baseline: bool = False, reset: bool = False) -> dict:
+    if reset and not baseline:
+        raise InboundError("Reset requires explicit baseline mode")
+    previous = store.state()
+    if baseline and previous is not None and not reset:
+        raise InboundError("Trakt baseline already exists; use --baseline --reset explicitly")
+    if not baseline and previous is None:
+        raise InboundError("Trakt baseline is missing; run --baseline first")
+    snapshot = read()
+    return store.publish(snapshot, expected_generation=previous["generation"] if previous else None,
+                         baseline=baseline, reset=reset)
+
+
+SCHEDULED_COUNTERS = (
+    "generation", "snapshot_changed", "added", "changed", "removed", "deferred",
+    "auto_apply_enabled", "auto_candidates", "auto_applied", "auto_grace_deferred",
+    "auto_failed", "canonical_mutations", "provider_writes",
+)
+
+
+def _print_scheduled_result(result: dict) -> None:
+    def print_counters(values: dict, prefix: str = "") -> None:
+        for key in SCHEDULED_COUNTERS:
+            if key in values:
+                value = values[key]
+                print(f"{prefix}{key}={str(value).lower() if type(value) is bool else value}")
+    if "media_results" not in result:
+        print_counters(result)
+        return
+    for media in ("movie", "show"):
+        if media in result["media_results"]:
+            print_counters(result["media_results"][media], media + "_")
+    for key in ("canonical_mutations", "provider_writes"):
+        print(f"{key}={result[key]}")
+    if "failed_media" in result:
+        print(f"failed_media={result['failed_media']}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Manual Trakt observation or explicitly confirmed single-event operations")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--baseline", action="store_true")
+    mode.add_argument("--once", action="store_true")
+    mode.add_argument("--scheduled-observe", action="store_true")
+    mode.add_argument("--apply-event", type=int)
+    mode.add_argument("--reclassify-event", type=int)
+    mode.add_argument("--apply-removal-event", type=int)
+    parser.add_argument("--media-type", choices=("movie", "show"), default="movie")
+    parser.add_argument("--expect-canonical-source")
+    parser.add_argument("--expect-event-type", choices=("removed",))
+    parser.add_argument("--expect-old-rating", type=int)
+    parser.add_argument("--confirm-reclassification", action="store_true")
+    parser.add_argument("--expect-content-key")
+    parser.add_argument("--expect-rating", type=int)
+    parser.add_argument("--expect-generation", type=int)
+    parser.add_argument("--expect-canonical-revision", type=int)
+    parser.add_argument("--confirm-live-import", action="store_true")
+    parser.add_argument("--observe-only", action="store_true")
+    parser.add_argument("--reset", action="store_true")
+    args = parser.parse_args(argv)
+    applying = args.apply_event is not None
+    reclassifying = args.reclassify_event is not None
+    removing = args.apply_removal_event is not None
+    if args.media_type != "movie" and (args.scheduled_observe or reclassifying):
+        print("Trakt show reclassification and scheduling refused; observe-only or guarded manual import required")
+        return 2
+    expectations = (args.expect_content_key, args.expect_rating,
+                    args.expect_generation, args.expect_canonical_revision)
+    repair_expectations = (args.expect_content_key, args.expect_generation,
+                           args.expect_event_type, args.expect_old_rating,
+                           args.expect_canonical_revision)
+    repair_only = (args.expect_event_type, args.expect_old_rating)
+    if args.scheduled_observe:
+        if (any(x is not None for x in expectations + repair_only)
+                or args.expect_canonical_source is not None or args.confirm_live_import
+                or args.confirm_reclassification or args.observe_only or args.reset):
+            print("Trakt scheduled observation refused: incompatible command flags")
+            return 2
+    elif removing:
+        required = (args.expect_content_key, args.expect_generation, args.expect_old_rating,
+                    args.expect_canonical_revision, args.expect_canonical_source)
+        if (not args.confirm_live_import or any(x is None for x in required)
+                or args.expect_rating is not None or args.expect_event_type is not None
+                or args.confirm_reclassification or args.observe_only or args.reset):
+            print("Trakt removal refused: require confirmation and explicit key/generation/old-rating/revision/source expectations")
+            return 2
+    elif applying:
+        if (not args.confirm_live_import or any(x is None for x in expectations)
+                or args.observe_only or args.reset or args.confirm_reclassification
+                or any(x is not None for x in repair_only) or args.expect_canonical_source is not None):
+            print("Trakt import refused: require confirmation and explicit key/rating/generation/revision expectations")
+            return 2
+    elif reclassifying:
+        if (not args.confirm_reclassification or any(x is None for x in repair_expectations)
+                or args.expect_rating is not None or args.confirm_live_import
+                or args.observe_only or args.reset or args.expect_canonical_source is not None):
+            print("Trakt reclassification refused: require confirmation and explicit key/generation/type/old-rating/revision expectations")
+            return 2
+    elif (any(x is not None for x in expectations + repair_only) or args.expect_canonical_source is not None
+          or args.confirm_live_import or args.confirm_reclassification
+          or args.once and (not args.observe_only or args.reset)
+          or args.baseline and args.observe_only or args.reset and not args.baseline):
+        print("Trakt observer refused: use --baseline [--reset] or --once --observe-only")
+        return 2
+    try:
+        inbound_settings = InboundSettings.from_env()
+        # The explicit manual modes remain available while automatic inbound is disabled.
+        from hub.providers.registry import get_provider
+        from hub.settings import HubSettings
+        settings = HubSettings.from_env()
+        if args.scheduled_observe:
+            from hub.inbound.scheduled import scheduled_observe_many
+            def read_scheduled(media: str) -> Snapshot:
+                with httpx.Client(timeout=10.0, follow_redirects=False) as client:
+                    return fetch_snapshot(get_provider("trakt"), client, media_type=media)
+            result = scheduled_observe_many(
+                settings.db_path, read_scheduled, enabled=inbound_settings.enabled,
+                media_types=inbound_settings.media_types,
+                auto_apply_enabled=inbound_settings.auto_apply,
+                max_events=inbound_settings.auto_apply_max_events,
+                echo_grace_seconds=inbound_settings.echo_grace_seconds, targets=settings.targets,
+            )
+            if result["skipped_overlap"]:
+                print("Trakt scheduled observation skipped: another instance is active")
+            else:
+                print("Trakt scheduled observation complete")
+                _print_scheduled_result(result)
+            if result["skipped_overlap"]:
+                print("canonical_mutations=0")
+                print("provider_writes=0")
+            return 0
+        store = InboundStore(settings.db_path, media_type=args.media_type)
+        if removing:
+            from hub.inbound.removal import apply_removal_event
+            result = apply_removal_event(
+                store, settings.targets, event_id=args.apply_removal_event,
+                expected_key=args.expect_content_key, expected_generation=args.expect_generation,
+                expected_old_rating=args.expect_old_rating, expected_revision=args.expect_canonical_revision,
+                expected_source=args.expect_canonical_source, confirmed=args.confirm_live_import,
+            )
+            print("Trakt inbound single-event removal import complete")
+            for key in ("event_id", "content_key", "revision", "removed", "queued_targets",
+                        "skipped_targets", "already_applied", "direct_provider_writes"):
+                print(f"{key}={result[key]}")
+            return 0
+        if reclassifying:
+            from hub.inbound.reclassification import reclassify_event
+            result = reclassify_event(
+                store, event_id=args.reclassify_event, expected_key=args.expect_content_key,
+                expected_generation=args.expect_generation, expected_event_type=args.expect_event_type,
+                expected_old_rating=args.expect_old_rating,
+                expected_revision=args.expect_canonical_revision,
+                confirmed=args.confirm_reclassification,
+            )
+            print("Trakt inbound single-event reclassification complete")
+            for key in ("event_id", "content_key", "generation"):
+                print(f"{key}={result[key]}")
+            for label in ("old", "new"):
+                for field in ("status", "classification", "reason"):
+                    print(f"{label}_{field}={result[label][field]}")
+            print(f"future_action={result['new']['future_action']}")
+            for key in ("already_reclassified", "canonical_mutations", "outbox_mutations", "provider_writes"):
+                print(f"{key}={result[key]}")
+            return 0
+        if applying:
+            from hub.inbound.importer import apply_event
+            result = apply_event(
+                store, settings.targets, event_id=args.apply_event,
+                expected_key=args.expect_content_key, expected_rating=args.expect_rating,
+                expected_generation=args.expect_generation,
+                expected_revision=args.expect_canonical_revision,
+                confirmed=args.confirm_live_import,
+            )
+            print("Trakt inbound single-event import complete")
+            for key in ("event_id", "content_key", "rating", "revision", "queued_targets",
+                        "skipped_targets", "already_applied"):
+                print(f"{key}={result[key]}")
+            print("direct_provider_writes=0")
+            return 0
+        with httpx.Client(timeout=10.0, follow_redirects=False) as client:
+            result = observe(store, lambda: fetch_snapshot(get_provider("trakt"), client, media_type=args.media_type),
+                             baseline=args.baseline, reset=args.reset)
+        print("Trakt inbound baseline created" if args.baseline else "Trakt inbound observation complete")
+        keys = ("movies", "eligible", "skipped", "snapshot_hash", "events") if args.baseline else (
+            "added", "changed", "removed", "deferred"
+        )
+        for key in (*keys, "generation", "snapshot_changed", "canonical_mutations", "provider_writes"):
+            value = result[key]
+            label = "shows" if args.media_type == "show" and key == "movies" else key
+            print(f"{label}={str(value).lower() if type(value) is bool else value}")
+        return 0
+    except InboundError as exc:
+        # Only fixed local messages and sanitized counters reach operator output.
+        if args.scheduled_observe and hasattr(exc, "result"):
+            print("Trakt scheduled media processing failed; completed work retained"
+                  if "media_results" in exc.result else
+                  "Trakt automatic application failed; remaining candidates retained")
+            _print_scheduled_result(exc.result)
+            return 1
+        print("Trakt scheduled observation failed; trusted state retained" if args.scheduled_observe
+              else str(exc))
+        return 1
+    except Exception:
+        if args.scheduled_observe:
+            print("Trakt scheduled observation failed; trusted state retained")
+        elif removing:
+            print("Trakt removal command failed; inspect canonical/event audit before retrying")
+        elif reclassifying:
+            print("Trakt event reclassification failed; no automatic retry")
+        else:
+            print("Trakt inbound command failed; inspect canonical/event audit before retrying" if applying
+                  else "Trakt inbound observation failed; trusted snapshot retained")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
