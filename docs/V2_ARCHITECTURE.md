@@ -506,3 +506,69 @@ controlled deployed dual-media no-op using an invocation-only environment
 override; it does not edit the permanent environment or enable recurring show
 polling. The final genuine movie-only timer activation must leave show state,
 including successful-poll metadata, untouched.
+
+## Episode rating observer foundation (repository only)
+
+The manual episode observer is separate from the movie/show production command:
+
+```sh
+python -m hub.inbound.episodes --baseline --db /path/to/episode-audit.sqlite3
+python -m hub.inbound.episodes --once --observe-only --db /path/to/episode-audit.sqlite3
+```
+
+The audit database must be selected explicitly; this command has no default
+production database. `--baseline --reset` explicitly replaces the trusted episode
+snapshot, advances its generation and retains event history. There is no scheduled,
+import, removal-import, reclassification or auto-apply mode. Production settings,
+units, images and provider credentials are outside this foundation change.
+
+The observer makes only authenticated GET requests to
+`/users/me/ratings/episodes`, as described in the
+[Trakt episode ratings reference](https://docs.trakt.tv/reference/getusersratingsepisodes).
+It follows all pages within one bounded deadline, verifies stable pagination
+headers and the final item count, refuses redirects, and validates the complete
+snapshot before any publication. HTTP/authentication/JSON failures produce fixed,
+credential-free errors. No titles or complete rating lists are logged.
+
+`EpisodeRating` uses the existing canonical identity
+`episode:tmdb:<tmdb_series_id>:s<season_number>:e<episode_number>`. The series ID
+comes only from `show.ids.tmdb`; coordinates come from `episode.season` and
+`episode.number`. Season zero is valid; episode numbers must be positive. IDs and
+coordinates are strict integers (never booleans, floats or numeric strings).
+`episode.ids.trakt`, `episode.ids.imdb` (an IMDb `tt` identifier) and the episode's
+own `episode.ids.tmdb` are optional episode metadata. Parent Trakt/IMDb IDs never
+stand in for episode IDs; the episode TMDb ID never stands in for its parent.
+Missing parent TMDb mapping is recorded as unmapped, not guessed or looked up via
+another provider. Malformed supplied IDs/coordinates fail the complete read.
+Duplicate canonical keys or duplicate episode metadata IDs, including conflicts
+across pages or mapped/unmapped rows, fail closed.
+
+Four dedicated tables hold observation state:
+`inbound_episode_state`, `inbound_episode_snapshots`,
+`inbound_episode_unmapped` and `inbound_episode_events`. They are initialized
+transactionally only by the explicit episode observer, with exact schema checks;
+unknown or partial schemas and attached triggers/indexes are refused. There is
+no migration or widening of the existing movie/show tables or constraints.
+Episode generations and deterministic hashes include only episode data. A
+baseline creates no events; identical polls update only successful-poll time.
+Added, changed and removed scores create observation-only audit events with
+`status=observed`, `reason=episode_import_disabled` and `future_action=NULL`.
+Removal audit retains the previous episode metadata and rating timestamp.
+Metadata-only changes advance the snapshot generation without inventing score
+changes. Trusted snapshot hashes, identities and row counts are checked before polling
+publication. Generation compare-and-swap and one SQLite transaction prevent partial
+publication; resets retain historical event fingerprints.
+
+Observation writes only these audit tables. The observer connection's SQLite
+authorizer denies writes to canonical ratings, outbox, existing movie/show tables
+and explicit sequence edits. Episode events cannot be marked applied and cannot
+carry a write action. Existing movie/show importers and scheduler still reject
+`episode`; recurring media selection remains limited to `movie` or `movie,show`.
+The manual episode module ignores inbound auto-apply environment settings and
+never invokes an importer, outbox worker or provider delivery method. Existing
+trusted canonical API capabilities are unchanged; this phase adds no inbound
+path into them.
+
+No deployment or production runtime change is part of this foundation. Tests use
+mock HTTP transports and local temporary databases, with the existing automatic
+network-denial fixture. All existing movie/show code and tests remain unchanged.
