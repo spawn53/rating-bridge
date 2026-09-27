@@ -24,6 +24,19 @@ def _bool_env(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw.strip())
+    except ValueError as exc:
+        raise ProviderNotConfigured(f"{name} must be numeric") from exc
+    if value < 0 or value > 60:
+        raise ProviderNotConfigured(f"{name} must be between 0 and 60 seconds")
+    return value
+
+
 def get_provider(name: str) -> RatingProvider:
     if name == "trakt":
         client_id = _env("TRAKT_CLIENT_ID")
@@ -65,7 +78,12 @@ def get_provider(name: str) -> RatingProvider:
         cookie = _env("IMDB_COOKIE")
         if not dry_run and not cookie:
             raise ProviderNotConfigured("IMDb V2 live writes require IMDB_COOKIE")
-        return IMDbProvider(cookie, dry_run=dry_run)
+        return IMDbProvider(
+            cookie,
+            dry_run=dry_run,
+            write_delay_seconds=_float_env("IMDB_V2_WRITE_DELAY_SECONDS", 2.0),
+            verify_writes=_bool_env("IMDB_V2_VERIFY_WRITES", True),
+        )
 
     if name == "letterboxd":
         if not _bool_env("LETTERBOXD_ENABLED", False):

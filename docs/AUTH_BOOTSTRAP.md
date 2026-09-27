@@ -60,3 +60,25 @@ Sources: [Trakt authentication](https://docs.trakt.tv/reference/auth),
 [MDBList OpenAPI schema](https://api.mdblist.com/schema/),
 [TMDb session guide](https://developer.themoviedb.org/reference/authentication-how-do-i-generate-a-session-id),
 [Simkl migration guide](https://api.simkl.org/guides/migrating-v1-to-v2).
+
+
+## Experimental IMDb V2 preflight
+
+IMDb V2 is deliberately excluded from the interactive OAuth bootstrap because it
+uses an authenticated IMDb browser cookie rather than a supported public user
+API. Keep `IMDB_V2_ENABLED=false` and `IMDB_V2_DRY_RUN=true` until a controlled
+pilot. Never commit the cookie or paste it into logs; store it only in the
+mode-0600 `.env.v2` file.
+
+Before any live write, choose one IMDb title that the account has already rated
+and configure `IMDB_PREFLIGHT_TITLE_ID=tt...` plus
+`IMDB_PREFLIGHT_EXPECTED_RATING=1..10`. The normal online provider preflight
+then performs only the authenticated GraphQL `userRating` read and returns
+`READY` only when the observed value exactly matches the expected value.
+An unrated probe, an expired/invalid cookie, or a mismatched value never grants
+READY. Offline preflight validates configuration only and makes no network call.
+
+Live IMDb mutations use a conservative configurable delay
+(`IMDB_V2_WRITE_DELAY_SECONDS`, default 2 seconds) and read-after-write
+verification by default (`IMDB_V2_VERIFY_WRITES=true`). Missing canonical IMDb
+IDs are treated as permanent unsupported deliveries rather than retried.

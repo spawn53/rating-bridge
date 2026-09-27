@@ -64,3 +64,62 @@ def test_default_targets_exclude_experimental_providers(monkeypatch: pytest.Monk
     from hub.settings import HubSettings
 
     assert HubSettings.from_env().targets == ("mdblist", "trakt", "simkl", "tmdb")
+
+
+
+def test_imdb_live_preflight_requires_exact_read_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.preflight_providers as preflight
+
+    monkeypatch.setenv("IMDB_V2_ENABLED", "true")
+    monkeypatch.setenv("IMDB_V2_DRY_RUN", "false")
+    monkeypatch.setenv("IMDB_COOKIE", "private-secret-marker")
+    monkeypatch.setenv("IMDB_PREFLIGHT_TITLE_ID", "tt0137523")
+    monkeypatch.setenv("IMDB_PREFLIGHT_EXPECTED_RATING", "9")
+    calls = []
+
+    def read(self, imdb_id):
+        calls.append(imdb_id)
+        return 9
+
+    monkeypatch.setattr(preflight.IMDbProvider, "read_personal_rating", read)
+    assert preflight._check_imdb(False) == "READY"
+    assert calls == ["tt0137523"]
+
+
+def test_imdb_preflight_mismatch_never_claims_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.preflight_providers as preflight
+
+    monkeypatch.setenv("IMDB_V2_ENABLED", "true")
+    monkeypatch.setenv("IMDB_V2_DRY_RUN", "false")
+    monkeypatch.setenv("IMDB_COOKIE", "private-secret-marker")
+    monkeypatch.setenv("IMDB_PREFLIGHT_TITLE_ID", "tt0137523")
+    monkeypatch.setenv("IMDB_PREFLIGHT_EXPECTED_RATING", "9")
+    monkeypatch.setattr(preflight.IMDbProvider, "read_personal_rating", lambda self, imdb_id: None)
+    assert preflight._check_imdb(False) == "AUTH_UNVERIFIED"
+
+
+def test_imdb_offline_preflight_makes_no_network_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.preflight_providers as preflight
+
+    monkeypatch.setenv("IMDB_V2_ENABLED", "true")
+    monkeypatch.setenv("IMDB_V2_DRY_RUN", "false")
+    monkeypatch.setenv("IMDB_COOKIE", "private-secret-marker")
+    monkeypatch.setenv("IMDB_PREFLIGHT_TITLE_ID", "tt0137523")
+    monkeypatch.setenv("IMDB_PREFLIGHT_EXPECTED_RATING", "9")
+    monkeypatch.setattr(
+        preflight.IMDbProvider,
+        "read_personal_rating",
+        lambda *a, **k: pytest.fail("offline preflight must not read"),
+    )
+    assert preflight._check_imdb(True) == "CONFIGURED"
+
+
+def test_imdb_live_preflight_needs_a_rated_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.preflight_providers as preflight
+
+    monkeypatch.setenv("IMDB_V2_ENABLED", "true")
+    monkeypatch.setenv("IMDB_V2_DRY_RUN", "false")
+    monkeypatch.setenv("IMDB_COOKIE", "private-secret-marker")
+    monkeypatch.delenv("IMDB_PREFLIGHT_TITLE_ID", raising=False)
+    monkeypatch.delenv("IMDB_PREFLIGHT_EXPECTED_RATING", raising=False)
+    assert preflight._check_imdb(False) == "NEEDS READ PROBE"

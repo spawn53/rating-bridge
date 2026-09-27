@@ -13,6 +13,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from hub.auth import auth_status
+from hub.providers.base import ProviderError
+from hub.providers.imdb_v2 import IMDbProvider
 
 
 def _value(name: str) -> str:
@@ -54,12 +56,46 @@ def _experimental(enabled_name: str, dry_run_name: str, credentials: tuple[str, 
     return "READY — live auth not tested"
 
 
+def _check_imdb(offline: bool) -> str:
+    if not _enabled("IMDB_V2_ENABLED"):
+        return "DISABLED"
+    if _enabled("IMDB_V2_DRY_RUN", True):
+        return "DRY-RUN"
+    cookie = _value("IMDB_COOKIE")
+    if not cookie:
+        return "MISSING LIVE CREDENTIALS"
+
+    probe_id = _value("IMDB_PREFLIGHT_TITLE_ID")
+    expected_raw = _value("IMDB_PREFLIGHT_EXPECTED_RATING")
+    try:
+        expected = int(expected_raw)
+    except ValueError:
+        expected = 0
+    if not (probe_id.startswith("tt") and probe_id[2:].isdigit() and 1 <= expected <= 10):
+        return "NEEDS READ PROBE"
+    if offline:
+        return "CONFIGURED"
+
+    try:
+        actual = IMDbProvider(
+            cookie,
+            dry_run=False,
+            write_delay_seconds=0,
+            verify_writes=False,
+        ).read_personal_rating(probe_id)
+    except (ProviderError, OSError):
+        return "AUTH_FAILED"
+    except Exception:
+        return "AUTH_FAILED"
+    return "READY" if actual == expected else "AUTH_UNVERIFIED"
+
+
 CHECKS: tuple[tuple[str, Callable[[bool], str]], ...] = (
     ("MDBList", _check_mdblist),
     ("Trakt", _check_trakt),
     ("Simkl", _check_simkl),
     ("TMDb", _check_tmdb),
-    ("IMDb", lambda offline: _experimental("IMDB_V2_ENABLED", "IMDB_V2_DRY_RUN", ("IMDB_COOKIE",))),
+    ("IMDb", _check_imdb),
     ("Letterboxd", lambda offline: _experimental("LETTERBOXD_ENABLED", "LETTERBOXD_DRY_RUN", ("LETTERBOXD_CLIENT_ID", "LETTERBOXD_CLIENT_SECRET", "LETTERBOXD_REFRESH_TOKEN"))),
 )
 
