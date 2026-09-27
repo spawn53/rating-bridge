@@ -301,7 +301,7 @@ def test_validation_and_delete_share_one_write_lock(store,monkeypatch):
     assert apply(store)['revision']==8
 
 
-@pytest.mark.parametrize('targets',[TARGETS,tuple(reversed(GLOBAL_TARGETS)),GLOBAL_TARGETS+('imdb',),('tmdb','trakt','simkl')])
+@pytest.mark.parametrize('targets',[TARGETS,tuple(reversed(GLOBAL_TARGETS)),('tmdb','trakt','simkl'),GLOBAL_TARGETS+('letterboxd',)])
 def test_removal_refuses_target_config_changes(store,targets):
     before=dump(store)
     with pytest.raises(InboundError):

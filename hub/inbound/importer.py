@@ -154,7 +154,7 @@ def apply_event(store: InboundStore, targets: Iterable[str], *, event_id: int,
 
     BEGIN IMMEDIATE holds validation through the canonical commit. A crash in
     the following audit gap is recovered only by exact provenance and a complete
-    exact target-plan payload audit, never by score equality alone.
+    target-plan payload audit, never by score equality alone.
     """
     media_type = validate_media_type(store.media_type)
     if confirmed is not True:

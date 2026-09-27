@@ -202,8 +202,9 @@ def test_newer_event_refuses_older_event_even_if_snapshot_manually_restored(stor
     assert dump(store) == before
 
 
-@pytest.mark.parametrize("targets", [TARGETS, GLOBAL_TARGETS + ("imdb",),
-                                     tuple(reversed(GLOBAL_TARGETS)), ("tmdb", "trakt", "simkl")])
+@pytest.mark.parametrize("targets", [TARGETS, tuple(reversed(GLOBAL_TARGETS)),
+                                     ("tmdb", "trakt", "simkl"),
+                                     GLOBAL_TARGETS + ("letterboxd",)])
 def test_unsafe_target_configuration_refused(store, targets):
     before = dump(store)
     with pytest.raises(InboundError):
