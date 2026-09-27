@@ -604,3 +604,53 @@ delivery method.
 No deployment or production runtime change is part of E3. Tests use mock HTTP
 transports and local temporary databases, with the existing automatic network-denial
 fixture. Existing movie/show target behavior remains unchanged.
+
+## TMDb episode read verification and isolated pilot harness
+
+E4A adds an authenticated, read-only `TMDbProvider.read_episode_rating` method for:
+
+```text
+GET /tv/{series_id}/season/{season_number}/episode/{episode_number}/account_states
+```
+
+The method uses the existing bearer token and TMDb account session. It accepts only
+a positive integer series ID, a non-negative integer season number and a positive
+integer episode number. `rated=false` maps to `None`; numeric ratings must be finite
+TMDb half-steps from 0.5 through 10. HTTP, authentication, JSON-shape and rating
+failures produce fixed errors without response bodies, URLs, tokens or session IDs.
+Movie/show delivery behavior is unchanged.
+
+The provider-isolation harness is separate from the API, worker, scheduler, inbound
+observer and canonical database. It resolves TMDb through the existing provider
+registry and never reads or writes canonical ratings, outbox rows, Trakt or IMDb:
+
+```sh
+python scripts/tmdb_episode_pilot.py --read-only \
+  --series-id SERIES --season SEASON --episode EPISODE
+
+python scripts/tmdb_episode_pilot.py --set-rating NEW_RATING \
+  --expect-current-unrated \
+  --series-id SERIES --season SEASON --episode EPISODE \
+  --confirm-live-write
+
+python scripts/tmdb_episode_pilot.py --set-rating NEW_RATING \
+  --expect-current-rating OLD_RATING \
+  --series-id SERIES --season SEASON --episode EPISODE \
+  --confirm-live-write
+
+python scripts/tmdb_episode_pilot.py --remove \
+  --expect-current-rating OLD_RATING \
+  --series-id SERIES --season SEASON --episode EPISODE \
+  --confirm-live-write
+```
+
+Read-only mode performs one account-state GET and no write. Mutation modes refuse
+to start without both `--confirm-live-write` and exactly one expected-current-state
+guard. They read and compare the starting state, perform one TMDb episode write or
+delete, then read again and require the exact desired result. A starting-state
+mismatch causes zero writes. A post-write mismatch fails with a fixed manual-review
+message because the provider may already have accepted the mutation.
+
+E4A does not deploy this script, add it to a unit or timer, enable episode auto-apply,
+or expand the explicit inbound target contract beyond
+`("trakt", "tmdb") -> ("tmdb",)`.
